@@ -361,9 +361,11 @@ fn an_app_that_clamps_the_park_move_has_its_real_position_recorded() {
     let parked_at = |h: &Harness| h.reactor.parked_registry().restore_set()[0].0.parked;
     assert_eq!(parked_at(&h), Point::new(-399., 999.));
 
-    // The user or system moving it is not a clamp of our write.
+    // The user or system moving it is not a clamp of our write; a parked window seen on
+    // screen is hidden again, with a new write.
     h.send(Event::WindowFrameChanged(wid(PID, 1), rect(5., 5., 400., 300.), txid, Requested(false), None));
     assert_eq!(parked_at(&h), Point::new(-399., 999.));
+    let txid = flush(&mut h, 11);
 
     landed(&mut h, 1, rect(-120., 700., 400., 300.), txid);
     assert_eq!(parked_at(&h), Point::new(-120., 700.));
@@ -491,6 +493,8 @@ fn restore_falls_back_to_the_current_display_when_the_saved_one_is_gone() {
     h.screens_named(&[left(1000.)]); // RIGHT is unplugged
     assert!(h.reactor.visibility().is_parked(wid(PID, 1)));
     assert_eq!(h.display_of(wid(PID, 1)), Some(DisplayUuid::new("LEFT")));
+    // macOS relocates parked windows when a display goes: they are parked again.
+    assert!(matches!(actions(&mut h).as_slice(), [VisibilityAction::Hide { .. }]));
 
     h.cmd(Command::Workspace("2".into())).unwrap();
     let acts = actions(&mut h);

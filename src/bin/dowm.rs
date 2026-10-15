@@ -168,6 +168,7 @@ mod daemon {
         reactor.set_parked_registry(registry);
         reactor.set_presenter(presenter_tx);
         reactor.set_event_bus(Arc::clone(&bus));
+        reactor.set_foreign_probe(dowm::sys::native_spaces::system_probe());
         std::thread::Builder::new()
             .name("reactor".into())
             .spawn(move || Executor::run(reactor.run(events_rx)))

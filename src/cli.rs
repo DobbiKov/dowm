@@ -80,7 +80,8 @@ pub fn print_workspaces(out: &mut impl Write, workspaces: &[WorkspaceInfo]) -> i
 
 pub fn print_windows(out: &mut impl Write, windows: &[WindowInfo]) -> io::Result<()> {
     for w in windows {
-        writeln!(out, "{} {}\t{}\t{}\t{}", flag(w.focused), w.id, opt(&w.app), opt(&w.workspace), clean(&w.title))?;
+        let marker = if w.foreign { "~" } else { flag(w.focused) };
+        writeln!(out, "{marker} {}\t{}\t{}\t{}", w.id, opt(&w.app), opt(&w.workspace), clean(&w.title))?;
     }
     Ok(())
 }
@@ -183,6 +184,7 @@ mod tests {
                 title: "a\nb\tc\u{1b}[31m".into(),
                 workspace: Some("2".into()),
                 focused: true,
+                foreign: false,
                 frame: Rect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
             }],
         )
@@ -205,6 +207,7 @@ mod tests {
                 title: "t\u{202e}".into(),
                 workspace: Some("w\nz".into()),
                 focused: false,
+                foreign: false,
                 frame: Rect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
             }],
         )

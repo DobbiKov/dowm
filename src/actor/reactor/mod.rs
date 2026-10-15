@@ -59,6 +59,8 @@ mod config_tests;
 pub mod effects;
 pub mod ipc;
 #[cfg(test)]
+mod space_tests;
+#[cfg(test)]
 mod focus_tests;
 #[cfg(test)]
 mod ipc_tests;
@@ -273,6 +275,9 @@ pub enum Event {
     StartupFinished,
     /// Focus-follows-mouse: the pointer has settled over this window.
     PointerSettledOn(WindowServerId),
+    /// The WindowServer windows currently in a native Space other than the visible one
+    /// (the complete set, sent whenever it changes).
+    ForeignWindows(Vec<WindowServerId>),
     /// A request from an IPC connection (query or command).
     Ipc(ipc::IpcRequest),
     /// A periodic nudge so time-based bookkeeping (unhide confirmation TTL) runs even
@@ -368,6 +373,25 @@ pub struct Reactor {
     next_raise_sequence: u64,
     /// What IPC subscribers were last told.
     ipc: ipc::IpcState,
+    /// Windows in a native macOS Space other than the one showing.
+    foreign: HashSet<WindowId>,
+    /// Asks the OS which of these WindowServer ids are in another native Space; polled on
+    /// every [`Event::VisibilityTick`]. `None` in tests and where Spaces cannot be read.
+    foreign_probe: Option<ForeignProbe>,
+}
+
+/// See [`Reactor::set_foreign_probe`].
+type ProbeFn = Box<dyn FnMut(&[u32]) -> Vec<u32> + Send>;
+
+struct ForeignProbe(ProbeFn);
+
+
+impl Default for ForeignProbe {
+    fn default() -> Self { ForeignProbe(Box::new(|_| Vec::new())) }
+}
+
+impl std::fmt::Debug for ForeignProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ForeignProbe") }
 }
 
 impl Reactor {
@@ -503,8 +527,11 @@ impl Reactor {
             }
             let visible = self.workspaces.window_is_visible(wid);
             let hideable = !record.is_minimized
+                && !self.visibility.is_foreign(wid)
+                && !self.visibility.is_given_up(wid)
                 && record.display.as_ref().is_some_and(|d| self.displays.get(d).is_some());
-            if visible && is_parked {
+            // A window in another native Space cannot be moved, so it may stay parked.
+            if visible && is_parked && !self.visibility.is_foreign(wid) {
                 return Err(format!("{wid:?} is on a visible workspace but parked"));
             }
             if !visible && hideable && !is_parked && !shutting_down {
@@ -633,7 +660,7 @@ impl Reactor {
         match target {
             Some(window) => {
                 self.focused_window = Some(window);
-                self.request_raise(window);
+                self.request_raise_explicit(window);
             }
             None => {
                 self.focused_window = None;
@@ -660,6 +687,29 @@ impl Reactor {
         if let Some(display) = display {
             self.workspaces.focus_display(display);
         }
+    }
+
+    /// Poll for windows in another native Space on every tick, using `probe`.
+    pub fn set_foreign_probe(&mut self, probe: impl FnMut(&[u32]) -> Vec<u32> + Send + 'static) {
+        self.foreign_probe = Some(ForeignProbe(Box::new(probe)));
+    }
+
+    fn poll_foreign_windows(&mut self) {
+        let ids = self.windows.sys_ids();
+        let Some(probe) = &mut self.foreign_probe else { return };
+        let foreign: Vec<WindowServerId> = (probe.0)(&ids).into_iter().map(WindowServerId::new).collect();
+        self.set_foreign_windows(&foreign);
+    }
+
+    fn set_foreign_windows(&mut self, ids: &[WindowServerId]) {
+        let foreign: HashSet<WindowId> =
+            ids.iter().filter_map(|&id| self.windows.by_sys_id(id)).map(|r| r.wid).collect();
+        if foreign == self.foreign {
+            return;
+        }
+        info!(count = foreign.len(), "windows in another native Space changed");
+        self.visibility.set_foreign(foreign.iter().copied().collect());
+        self.foreign = foreign;
     }
 
     /// Bring every workspace tree in line with workspace membership.
@@ -712,7 +762,7 @@ impl Reactor {
         if tree.fullscreen() == Some(window) && target != window {
             tree.toggle_fullscreen(window);
         }
-        self.request_raise(target);
+        self.request_raise_explicit(target);
         Ok(())
     }
 
@@ -968,12 +1018,13 @@ impl Reactor {
                     warn!(?actions, %error, "actions stopped at the first failure");
                 }
             }
+            Event::ForeignWindows(ids) => self.set_foreign_windows(&ids),
             Event::Ipc(request) => self.handle_ipc(request),
             Event::ConfigReloaded(config) => self.apply_config(config),
             Event::StartupFinished => self.finish_startup(),
             Event::PointerSettledOn(wsid) => self.focus_window_under_pointer(wsid),
-            Event::VisibilityTick
-            | Event::MenuOpened(_)
+            Event::VisibilityTick => self.poll_foreign_windows(),
+            Event::MenuOpened(_)
             | Event::MenuClosed(_)
             | Event::RaiseTargetsMissing { .. }
             | Event::RaiseCompleted { .. } => {}
@@ -1126,6 +1177,10 @@ impl Reactor {
             _ = tx.send(Message::Displays(ids));
         }
         self.workspaces.displays_changed(&changes, &self.displays);
+        self.visibility.reset_retries();
+        if !changes.removed.is_empty() {
+            self.visibility.display_removed(&self.parked_registry);
+        }
         for uuid in &changes.added {
             let d = self.displays.get(uuid).expect("just added");
             info!(%uuid, cg_id = d.cg_id.as_u32(), name = ?d.name, frame = ?d.frame, "display added");

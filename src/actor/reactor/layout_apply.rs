@@ -64,6 +64,7 @@ impl Reactor {
             targets.retain(|t| {
                 self.windows.get(t.window).is_some_and(|r| !r.is_minimized)
                     && !self.visibility.is_parked(t.window)
+                    && !self.foreign.contains(&t.window)
             });
         }
         let live: HashSet<WindowId> =

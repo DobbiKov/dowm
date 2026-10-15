@@ -92,6 +92,10 @@ pub struct WindowInfo {
     pub title: String,
     pub workspace: Option<String>,
     pub focused: bool,
+    /// In a native macOS Space other than the one showing: dowm cannot see or move it
+    /// and leaves it alone until it returns.
+    #[serde(default)]
+    pub foreign: bool,
     pub frame: Rect,
 }
 

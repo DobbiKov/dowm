@@ -29,6 +29,7 @@ pub mod geometry;
 // The `Arc`s here only feed CF retain/release; their contents stay on the run-loop
 // thread and are `!Send` by construction.
 #[allow(clippy::arc_with_non_send_sync, clippy::new_ret_no_self)]
+pub mod native_spaces;
 pub mod observer;
 pub mod power;
 #[allow(clippy::field_reassign_with_default)]

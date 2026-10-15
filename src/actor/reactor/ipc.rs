@@ -99,6 +99,7 @@ impl Reactor {
                     .and_then(|id| self.workspaces.name(id))
                     .map(str::to_owned),
                 focused: self.focused_window == Some(record.wid),
+                foreign: self.foreign.contains(&record.wid),
                 frame: rect(record.frame),
             })
             .collect();

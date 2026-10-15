@@ -15,6 +15,7 @@
 //! Nothing here touches AX; [`layout_calls`] turns the actions into the presenter calls the
 //! reactor makes.
 
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -169,6 +170,8 @@ struct Parked {
     /// Where it was put, and the registry target last published for it.
     parked_at: Point,
     restore_to: Point,
+    /// The app reported the window off screen after our write: it got where it was sent.
+    settled: bool,
 }
 
 /// A window that must be at least this many pixels (each way, or its whole extent if
@@ -182,7 +185,28 @@ pub struct VisibilityTracker {
     /// They stay in the registry until it is: the plan is not the write, and the write is
     /// not the app accepting it.
     unconfirmed: BTreeMap<WindowId, Write>,
+    /// Windows that must be parked again (macOS moved them, or their display went away),
+    /// with the position to restore them to, which is kept rather than re-read from where
+    /// macOS dropped them.
+    rehide: BTreeMap<WindowId, SavedPosition<DisplayUuid>>,
+    /// How many times each window has been put back after reappearing on screen once its
+    /// park had landed (something moved it back).
+    reparks: BTreeMap<WindowId, u8>,
+    /// How many times a hide write never took effect (the app was busy or mid display
+    /// teardown); these deserve far more patience.
+    failed_hides: BTreeMap<WindowId, u8>,
+    /// Windows that kept coming back; left alone until their workspace is shown.
+    gave_up: BTreeSet<WindowId>,
+    /// Windows in another native Space: not reachable, so neither parked nor unparked.
+    foreign: BTreeSet<WindowId>,
 }
+
+/// A parked window that reappears on screen is parked again at most this many times.
+const MAX_REPARKS: u8 = 3;
+
+/// A hide that never landed is retried this many times (one per [`UNCONFIRMED_TTL`], so
+/// about half a minute): macOS takes seconds to settle after a display change.
+const MAX_FAILED_HIDES: u8 = 15;
 
 /// The display rects, in store order, as the parking geometry wants them.
 struct Layout {
@@ -215,6 +239,54 @@ impl Layout {
 
 impl VisibilityTracker {
     pub fn is_parked(&self, window: WindowId) -> bool { self.parked.contains_key(&window) }
+
+    /// The windows currently in another native Space.
+    pub fn set_foreign(&mut self, windows: BTreeSet<WindowId>) { self.foreign = windows; }
+
+    pub fn is_foreign(&self, window: WindowId) -> bool { self.foreign.contains(&window) }
+
+    /// A parked window that kept reappearing on screen and is no longer being re-parked.
+    pub fn is_given_up(&self, window: WindowId) -> bool { self.gave_up.contains(&window) }
+
+    /// A display went away. macOS relocates windows parked beyond it, so none of the
+    /// parked positions can be trusted: park everything again against what remains,
+    /// keeping where each window goes back to.
+    pub fn display_removed(&mut self, registry: &SharedRegistry<ParkedHandle>) {
+        self.reset_retries();
+        for (wid, parked) in std::mem::take(&mut self.parked) {
+            registry.unpark(registry_key(wid));
+            self.rehide.insert(wid, parked.saved);
+        }
+    }
+
+    /// The display set changed: windows given up on get a fresh start, since the cause
+    /// (macOS shuffling windows) is over or has changed.
+    pub fn reset_retries(&mut self) {
+        self.gave_up.clear();
+        self.reparks.clear();
+        self.failed_hides.clear();
+    }
+
+    /// A parked window was seen on screen without us putting it there.
+    fn displaced(&mut self, window: WindowId, registry: &SharedRegistry<ParkedHandle>) {
+        let Some(parked) = self.parked.remove(&window) else { return };
+        registry.unpark(registry_key(window));
+        // A park that landed and was then undone is something fighting us; one that never
+        // landed is just slow.
+        let (counter, cap) = if parked.settled {
+            (&mut self.reparks, MAX_REPARKS)
+        } else {
+            (&mut self.failed_hides, MAX_FAILED_HIDES)
+        };
+        let tries = counter.entry(window).or_insert(0);
+        *tries += 1;
+        if *tries > cap {
+            tracing::warn!(?window, "a parked window keeps reappearing on screen; leaving it alone");
+            self.gave_up.insert(window);
+        } else {
+            self.rehide.insert(window, parked.saved);
+        }
+    }
 
     pub fn parked(&self) -> impl Iterator<Item = WindowId> + '_ { self.parked.keys().copied() }
 
@@ -258,6 +330,14 @@ impl VisibilityTracker {
             present
         });
 
+        // Bookkeeping only for windows that still exist and are still hidden.
+        let still_hidden =
+            |wid: &WindowId| windows.contains(*wid) && !workspaces.window_is_visible(*wid);
+        self.rehide.retain(|wid, _| still_hidden(wid));
+        self.gave_up.retain(still_hidden);
+        self.reparks.retain(|wid, _| windows.contains(*wid));
+        self.failed_hides.retain(|wid, _| windows.contains(*wid));
+
         let layout = Layout::new(displays);
         let mut unhides = Vec::new();
         let mut hides = Vec::new();
@@ -266,7 +346,11 @@ impl VisibilityTracker {
             .parked
             .keys()
             .copied()
-            .filter(|&wid| workspaces.workspace_of(wid).is_some() && workspaces.window_is_visible(wid))
+            .filter(|&wid| {
+                workspaces.workspace_of(wid).is_some()
+                    && workspaces.window_is_visible(wid)
+                    && !self.foreign.contains(&wid)
+            })
             .collect();
         for wid in shown {
             let record = windows.get(wid).expect("retained above");
@@ -282,6 +366,8 @@ impl VisibilityTracker {
                 fallback_display
             };
             self.parked.remove(&wid);
+            self.reparks.remove(&wid);
+            self.failed_hides.remove(&wid);
             // Stays registered, now pointing where it is going, until it is seen there.
             registry.set_target(registry_key(wid), to);
             self.unconfirmed.insert(wid, Write::default());
@@ -301,6 +387,8 @@ impl VisibilityTracker {
         for record in candidates {
             let wid = record.wid;
             if self.parked.contains_key(&wid)
+                || self.foreign.contains(&wid)
+                || self.gave_up.contains(&wid)
                 || record.is_minimized
                 || workspaces.workspace_of(wid).is_none()
                 || workspaces.window_is_visible(wid)
@@ -314,7 +402,10 @@ impl VisibilityTracker {
 
             let corner = choose_corner(&layout.rects, index);
             let parked_at = park_origin(rect, corner, frame.size);
-            let saved = save_position(display.clone(), rect, frame.origin);
+            let saved = self
+                .rehide
+                .remove(&wid)
+                .unwrap_or_else(|| save_position(display.clone(), rect, frame.origin));
             let restore_to = resolve_restore(&saved, frame.size, &layout.keyed, rect);
 
             let handle = ParkedHandle {
@@ -334,7 +425,10 @@ impl VisibilityTracker {
                 continue; // shutdown began; leave the window (and any entry) as it is
             }
             self.unconfirmed.remove(&wid);
-            self.parked.insert(wid, Parked { saved, parked_at, restore_to, write: Write::default() });
+            self.parked.insert(
+                wid,
+                Parked { saved, parked_at, restore_to, write: Write::default(), settled: false },
+            );
             hides.push(VisibilityAction::Hide {
                 window: wid,
                 display,
@@ -380,6 +474,15 @@ impl VisibilityTracker {
         displays: &DisplayStore,
         registry: &SharedRegistry<ParkedHandle>,
     ) {
+        // A parked window we did not move, now on screen: macOS relocated it (a display was
+        // unplugged). Hide it again.
+        if !requested
+            && self.parked.get(&window).is_some_and(|p| p.settled)
+            && is_on_screen(frame, displays)
+        {
+            self.displaced(window, registry);
+            return;
+        }
         if !requested {
             return;
         }
@@ -393,6 +496,7 @@ impl VisibilityTracker {
         if let Some(parked) = self.parked.get_mut(&window)
             && parked.write.answers(txid)
         {
+            parked.settled = !is_on_screen(frame, displays);
             let at = Point::new(frame.origin.x, frame.origin.y);
             let moved = (at.x - parked.parked_at.x).abs() > 1.0 || (at.y - parked.parked_at.y).abs() > 1.0;
             if moved {
@@ -420,6 +524,23 @@ impl VisibilityTracker {
         displays: &DisplayStore,
         registry: &SharedRegistry<ParkedHandle>,
     ) {
+        // A parked window still on screen once its write is settled or overdue never got
+        // where it was sent (the write failed, or macOS moved it back): park it again.
+        let failed: Vec<WindowId> = self
+            .parked
+            .iter()
+            .filter(|(wid, p)| {
+                let overdue = p.write.deadline.is_some_and(|d| d <= now);
+                (p.settled || overdue)
+                    && !self.foreign.contains(*wid)
+                    && windows.get(**wid).is_some_and(|r| is_on_screen(r.frame, displays))
+            })
+            .map(|(&wid, _)| wid)
+            .collect();
+        for wid in failed {
+            self.displaced(wid, registry);
+        }
+
         let due: Vec<WindowId> = self
             .unconfirmed
             .iter()

@@ -49,6 +49,7 @@ fn every_response_round_trips() {
                 title: "héllo \u{1F600}".into(),
                 workspace: Some("1".into()),
                 focused: false,
+                foreign: false,
                 frame: Rect { x: 0.0, y: 24.0, width: 800.0, height: 600.5 },
             }],
         },

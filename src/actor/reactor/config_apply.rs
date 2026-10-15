@@ -334,8 +334,21 @@ impl Reactor {
         Ok(())
     }
 
-    /// Ask the window's app to raise and focus it.
+    /// Ask the window's app to raise and focus it, as a side effect of layout or the
+    /// pointer. Not for a window in another native Space: raising it makes macOS animate
+    /// a switch to that Space, which nobody asked for.
     pub(super) fn request_raise(&mut self, window: WindowId) {
+        if self.foreign.contains(&window) {
+            debug!(?window, "not raising a window in another native Space");
+            return;
+        }
+        self.request_raise_explicit(window);
+    }
+
+    /// Like [`Self::request_raise`], for a window the user asked for (`focus`, a workspace
+    /// switch). If it is in another native Space, macOS switches there: the only way to
+    /// reach it.
+    pub(super) fn request_raise_explicit(&mut self, window: WindowId) {
         let Some(app) = self.apps.get(&window.pid) else { return };
         self.next_raise_sequence += 1;
         _ = app.handle.send(app::Request::Raise(

@@ -68,8 +68,18 @@ impl Client {
             }
             _ => ClientError::Io(e),
         })?;
-        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
-        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+        // macOS refuses setsockopt (EINVAL) on a socket whose peer already closed, which is
+        // what a server that turns us away ("too many connections") does. Carry on: the
+        // first read then delivers the server's reason instead of a bare EINVAL.
+        for result in [
+            stream.set_read_timeout(Some(REQUEST_TIMEOUT)),
+            stream.set_write_timeout(Some(REQUEST_TIMEOUT)),
+        ] {
+            match result {
+                Err(e) if e.kind() != io::ErrorKind::InvalidInput => return Err(e.into()),
+                _ => {}
+            }
+        }
         Ok(Self { stream })
     }
 

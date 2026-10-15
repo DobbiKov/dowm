@@ -238,7 +238,9 @@ mod tests {
 
     fn connect(h: &Harness) -> UnixStream {
         let stream = UnixStream::connect(&h.path).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // EINVAL here means the server already closed (it turned us away); the read
+        // below then reports why.
+        _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         stream
     }
 
