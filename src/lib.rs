@@ -12,11 +12,14 @@
 //!   and the platform actors in `actor::input` carry out its effects.
 
 pub mod anim;
+pub mod cli;
 pub mod appspec;
 pub mod criterion;
 pub mod easing;
 pub mod frame_writer;
 pub mod geometry;
+#[cfg(target_os = "macos")]
+pub mod ipc;
 pub mod parking;
 pub mod report;
 pub mod restore;

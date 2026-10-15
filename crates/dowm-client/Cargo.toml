@@ -1,0 +1,11 @@
+[package]
+name = "dowm-client"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Client library for the dowm daemon's Unix-socket IPC (used by the dowm CLI)"
+
+[dependencies]
+dowm-protocol = { path = "../dowm-protocol" }
+thiserror = "2"
+libc = "0.2"

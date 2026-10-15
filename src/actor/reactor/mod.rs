@@ -57,8 +57,11 @@ mod layout_apply_tests;
 #[cfg(test)]
 mod config_tests;
 pub mod effects;
+pub mod ipc;
 #[cfg(test)]
-mod testing;
+mod ipc_tests;
+#[cfg(test)]
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -268,6 +271,8 @@ pub enum Event {
     StartupFinished,
     /// Focus-follows-mouse: the pointer has settled over this window.
     PointerSettledOn(WindowServerId),
+    /// A request from an IPC connection (query or command).
+    Ipc(ipc::IpcRequest),
     /// A periodic nudge so time-based bookkeeping (unhide confirmation TTL) runs even
     /// when nothing else happens.
     VisibilityTick,
@@ -359,6 +364,8 @@ pub struct Reactor {
     last_focus: config_apply::FocusSnapshot,
     in_callback: bool,
     next_raise_sequence: u64,
+    /// What IPC subscribers were last told.
+    ipc: ipc::IpcState,
 }
 
 impl Reactor {
@@ -772,12 +779,15 @@ impl Reactor {
     }
 
     pub async fn run(mut self, mut events: Receiver) {
+        // Record the starting state so the first change reports the right `previous`.
+        self.publish_ipc_changes();
         while let Some((span, event)) = events.recv().await {
             let _guard = span.enter();
             self.handle_event(event);
             self.flush_visibility();
             self.flush_layout();
             self.flush_effects();
+            self.publish_ipc_changes();
         }
     }
 
@@ -901,6 +911,7 @@ impl Reactor {
                     warn!(?actions, %error, "actions stopped at the first failure");
                 }
             }
+            Event::Ipc(request) => self.handle_ipc(request),
             Event::ConfigReloaded(config) => self.apply_config(config),
             Event::StartupFinished => self.finish_startup(),
             Event::PointerSettledOn(wsid) => self.focus_window_under_pointer(wsid),

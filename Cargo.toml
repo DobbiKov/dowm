@@ -1,3 +1,10 @@
+[workspace]
+members = [".", "crates/dowm-protocol", "crates/dowm-client"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+
 [package]
 name = "dowm"
 version = "0.0.1"
@@ -29,10 +36,15 @@ custom-event-loop = ["objc2-foundation/NSDate", "objc2-foundation/NSRunLoop"]
 disable-axuielement-destroyed = []
 
 [dependencies]
+dowm-protocol = { path = "crates/dowm-protocol" }
+dowm-client = { path = "crates/dowm-client" }
 clap = { version = "4.5.4", features = ["derive"] }
 crossbeam-channel = "0.5"
 signal-hook = "0.3"
 toml = "1.1.8"
+libc = "0.2"
+thiserror = "2"
+serde_json = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -58,8 +70,8 @@ tokio-util = "0.7.15"
 tracing = "0.1.40"
 objc2 = { version = "0.6.2", default-features = false, features = ["exception"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
-    "NSApplication", "NSEvent", "NSGraphics", "NSResponder", "NSRunningApplication", "NSScreen",
-    "NSView", "NSWindow", "NSWorkspace", "libc", "objc2-core-foundation", "objc2-core-graphics",
+    "NSApplication", "NSButton", "NSControl", "NSEvent", "NSGraphics", "NSResponder", "NSRunningApplication", "NSScreen",
+    "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "NSWindow", "NSWorkspace", "libc", "objc2-core-foundation", "objc2-core-graphics",
     "objc2-quartz-core",
 ] }
 objc2-application-services = { version = "0.3.2", default-features = false, features = [

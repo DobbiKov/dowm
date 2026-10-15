@@ -372,6 +372,9 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "dispatchr",
+ "dowm-client",
+ "dowm-protocol",
+ "libc",
  "nix",
  "num_enum",
  "objc2",
@@ -386,16 +389,36 @@ dependencies = [
  "regex",
  "rustc-hash",
  "serde",
+ "serde_json",
  "serde_with",
  "signal-hook",
  "static_assertions",
  "strum_macros",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "dowm-client"
+version = "0.0.1"
+dependencies = [
+ "dowm-protocol",
+ "libc",
+ "thiserror",
+]
+
+[[package]]
+name = "dowm-protocol"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

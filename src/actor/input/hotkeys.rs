@@ -86,6 +86,7 @@ pub(crate) fn decide(shared: &Shared, keycode: u16, flags: u64, autorepeat: bool
         return KeyOutcome::Swallow(Vec::new());
     }
     // Mode switches happen now, in order, so the next key sees the new mode.
+    let before = modes.current_mode().to_owned();
     let mut forwarded = Vec::with_capacity(actions.len());
     for action in actions {
         match action {
@@ -97,6 +98,7 @@ pub(crate) fn decide(shared: &Shared, keycode: u16, flags: u64, autorepeat: bool
             other => forwarded.push(other),
         }
     }
+    shared.announce_mode_change(&before, &modes);
     KeyOutcome::Swallow(forwarded)
 }
 

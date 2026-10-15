@@ -17,6 +17,7 @@ use tracing::Span;
 )]
 pub mod app;
 pub mod input;
+pub mod menubar;
 pub mod notification_center;
 pub mod reactor;
 pub mod window_notify;

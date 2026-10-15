@@ -27,7 +27,7 @@ pub async fn run(mut effects: EffectReceiver, shared: Arc<Shared>, watcher: Watc
 fn apply(effect: Effect, shared: &Shared, watcher: &WatchHandle) {
     match effect {
         Effect::Exec(shell) => exec_and_forget(&shell),
-        Effect::SetMode(name) => match shared.modes.lock().set_mode(&name) {
+        Effect::SetMode(name) => match shared.set_mode(&name) {
             Ok(()) => info!(mode = %name, "binding mode"),
             Err(error) => warn!(%error, "mode not switched"),
         },
