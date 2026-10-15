@@ -59,6 +59,8 @@ mod config_tests;
 pub mod effects;
 pub mod ipc;
 #[cfg(test)]
+mod focus_tests;
+#[cfg(test)]
 mod ipc_tests;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -550,6 +552,15 @@ impl Reactor {
     pub fn run_command(&mut self, command: Command) -> Result<(), CommandError> {
         self.forget_destroyed_focus();
         self.sync_trees();
+        // Commands that change which workspace the user is looking at must also move
+        // real keyboard focus there, or the screen changes and the keys still go elsewhere.
+        let refocus = matches!(
+            command,
+            Command::Workspace(_)
+                | Command::WorkspaceBackAndForth
+                | Command::FocusMonitor(_)
+                | Command::MoveWorkspaceToMonitor(_)
+        );
         let result = match command {
             Command::Workspace(name) => match self.workspaces.id_by_name(&name) {
                 Ok(id) => self
@@ -600,10 +611,55 @@ impl Reactor {
         };
         // Membership may have changed (move-node-to-workspace): the leaf follows.
         self.sync_trees();
+        if refocus && result.is_ok() {
+            self.refocus_after_switch();
+        }
         self.check_focus_callbacks();
         self.sync_visibility();
         self.debug_check_invariants();
         result
+    }
+
+    /// After a switch: focus the window the focused workspace's tree rests on. An empty
+    /// workspace has none, so focus is cleared (commands must not act on the window just
+    /// hidden) and the pointer is brought to its monitor instead.
+    fn refocus_after_switch(&mut self) {
+        let Some(workspace) = self.workspaces.focused_workspace() else { return };
+        let target = self
+            .trees
+            .get(workspace)
+            .and_then(|tree| tree.focused_window())
+            .filter(|&w| self.workspaces.workspace_of(w) == Some(workspace));
+        match target {
+            Some(window) => {
+                self.focused_window = Some(window);
+                self.request_raise(window);
+            }
+            None => {
+                self.focused_window = None;
+                let frame = self
+                    .workspaces
+                    .focused_display()
+                    .and_then(|display| self.displays.get(display))
+                    .map(|display| display.frame);
+                if let Some(rect) = frame {
+                    self.effects.push(Effect::MoveMouse { rect, lazy: true });
+                }
+            }
+        }
+    }
+
+    /// The focused display is the one showing the focused window's workspace. A window
+    /// on a hidden workspace (an app activated it behind our back) changes nothing.
+    fn follow_focus_display(&mut self, window: WindowId) {
+        let display = self
+            .workspaces
+            .workspace_of(window)
+            .and_then(|workspace| self.workspaces.display_of(workspace))
+            .cloned();
+        if let Some(display) = display {
+            self.workspaces.focus_display(display);
+        }
     }
 
     /// Bring every workspace tree in line with workspace membership.
@@ -835,6 +891,7 @@ impl Reactor {
                     {
                         tree.set_focus(wid);
                     }
+                    self.follow_focus_display(wid);
                 }
             }
             Event::WindowsDiscovered { pid, token, successful, new, known_visible: _ } => {

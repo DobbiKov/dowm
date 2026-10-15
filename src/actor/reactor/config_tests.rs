@@ -309,6 +309,8 @@ fn actions_run_in_order_and_meta_commands_become_effects() {
     h.send(Event::Actions(actions.to_vec()));
     assert_eq!(h.active("D"), Some(2));
     assert_eq!(h.effects(), vec![
+        // Workspace 2 is empty, so the pointer is brought to the monitor.
+        Effect::MoveMouse { rect: rect(0., 0., 900., 600.), lazy: true },
         Effect::Exec("echo hi".into()),
         Effect::ReloadConfig,
         Effect::SetMode("service".into()),
@@ -620,7 +622,9 @@ fn a_workspace_with_no_window_fires_nothing_harmful() {
     focus(&mut h, 1);
     h.effects();
     h.cmd(Command::Workspace("5".into())).unwrap();
-    assert!(mouse_effects(&h.effects()).is_empty(), "no window to center on: the callback fails quietly");
+    let moves = mouse_effects(&h.effects());
+    assert_eq!(moves.len(), 1, "only the monitor move; the window callback has nothing to center on");
+    assert!(moves[0].1);
 }
 
 #[test]
