@@ -145,6 +145,35 @@ fn focus_follows_mouse() {
 }
 
 #[test]
+fn animations_default_on_with_a_third_of_a_second() {
+    let c = ok(MIN);
+    assert!(c.animations);
+    assert_eq!(c.animation_duration, 0.3);
+}
+
+#[test]
+fn animations_can_be_turned_off_and_timed() {
+    assert!(!ok(&with("animations = false")).animations);
+    let c = ok(&with("animation-duration = 0.5"));
+    assert_eq!(c.animation_duration, 0.5);
+    assert_eq!(ok(&with("animation-duration = 1")).animation_duration, 1.0, "an integer is fine");
+}
+
+#[test]
+fn bad_animation_values_name_their_keys() {
+    for (text, path) in [
+        ("animations = 'no'", "animations"),
+        ("animations = 0", "animations"),
+        ("animation-duration = 'fast'", "animation-duration"),
+        ("animation-duration = 0", "animation-duration"),
+        ("animation-duration = -0.2", "animation-duration"),
+        ("animation-duration = 60", "animation-duration"),
+    ] {
+        assert_eq!(paths(&err(&with(text))), vec![path], "{text}");
+    }
+}
+
+#[test]
 fn workspace_auto_back_and_forth() {
     assert!(ok(&with("workspace-auto-back-and-forth = true")).workspace_auto_back_and_forth);
     assert!(ok(&with("workspace-auto-back-and-forth = true")).workspace_config().auto_back_and_forth);

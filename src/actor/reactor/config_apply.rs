@@ -90,6 +90,10 @@ impl Reactor {
         };
         self.trees.set_root_defaults(layout, orientation);
 
+        self.set_visibility_config(super::VisibilityConfig { animate_switches: config.animations });
+        self.presenter.settings.animate = config.animations;
+        self.presenter.settings.duration = config.animation_duration;
+
         self.workspaces.set_auto_back_and_forth(config.workspace_auto_back_and_forth);
         let assignments: Vec<ForceAssignment> = config
             .force_assignments

@@ -9,6 +9,10 @@ default-root-container-orientation = 'auto'
 key-mapping.preset = 'qwerty'
 focus-follows-mouse = false
 
+# Slide windows on workspace switches and layout changes; false makes them jump.
+animations = true
+animation-duration = 0.3 # seconds
+
 [gaps]
 inner.horizontal = 0
 inner.vertical = 0

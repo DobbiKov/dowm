@@ -27,6 +27,12 @@ left alone, and raised only when you ask for them (`workspace N`, `focus`), at w
 macOS animates the switch to their Space. The daemon logs a warning at startup if the
 setting is on. To merge a stray Space by hand, delete the extra desktop in Mission Control.
 
+## Animations
+
+Workspace switches and layout changes slide by default. Set `animations = false` in the
+config to make windows jump instead; `animation-duration = 0.3` (seconds) sets how long a
+slide lasts. Both apply on hot reload.
+
 ## Control socket and CLI
 
 The daemon listens on a Unix socket (`$TMPDIR/dowm-<uid>/dowm.sock`, directory 0700, socket

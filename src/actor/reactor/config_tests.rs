@@ -850,3 +850,24 @@ fn the_focus_command_asks_the_app_to_raise_the_window() {
     h.tile(Command::Focus { direction: Direction::Right, wrap: false }).unwrap();
     assert_eq!(raised(&mut h), vec![wid(PID, 2)]);
 }
+
+
+// ---- animations ----
+
+#[test]
+fn the_animations_key_switches_animation_off_and_back_on_live() {
+    use super::animation::PresenterHost;
+    let mut h = one_display(&cfg(""));
+    assert!(h.reactor.visibility_config().animate_switches);
+    assert!(PresenterHost::animation_settings(&h.reactor).animate);
+
+    h.send(Event::ConfigReloaded(parse(&cfg("animations = false"))));
+    assert!(!h.reactor.visibility_config().animate_switches, "workspace switches jump");
+    assert!(!PresenterHost::animation_settings(&h.reactor).animate, "layout moves jump");
+
+    h.send(Event::ConfigReloaded(parse(&cfg("animations = true\nanimation-duration = 0.5"))));
+    assert!(h.reactor.visibility_config().animate_switches);
+    let settings = PresenterHost::animation_settings(&h.reactor);
+    assert!(settings.animate);
+    assert_eq!(settings.duration, 0.5);
+}

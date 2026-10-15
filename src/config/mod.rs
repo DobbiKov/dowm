@@ -49,6 +49,12 @@ use crate::model::workspace::{ForceAssignment, MonitorPattern, WorkspaceConfig};
 /// The embedded default config, used when no file exists.
 pub const DEFAULT_CONFIG: &str = include_str!("default.toml");
 
+/// Seconds one animation lasts unless configured.
+pub const DEFAULT_ANIMATION_DURATION: f64 = 0.3;
+
+/// Longer than this is a typo, not a style.
+const MAX_ANIMATION_DURATION: f64 = 5.0;
+
 /// AeroSpace's default `accordion-padding`.
 pub const DEFAULT_ACCORDION_PADDING: u32 = 30;
 
@@ -110,6 +116,10 @@ pub struct Config {
     pub on_focus_changed: Vec<Action>,
     /// dowm-only: focus the window under the mouse.
     pub focus_follows_mouse: bool,
+    /// dowm-only: slide windows on workspace switches and layout changes. Off: they jump.
+    pub animations: bool,
+    /// dowm-only: seconds one animation lasts.
+    pub animation_duration: f64,
     pub gaps: Gaps,
     /// Every binding mode; `main` is always present.
     pub modes: BTreeMap<String, Mode>,
@@ -250,6 +260,8 @@ pub fn parse(text: &str) -> Result<Config, ConfigErrors> {
         on_focused_monitor_changed: Vec::new(),
         on_focus_changed: Vec::new(),
         focus_follows_mouse: false,
+        animations: true,
+        animation_duration: DEFAULT_ANIMATION_DURATION,
         gaps: Gaps::default(),
         modes: BTreeMap::new(),
         window_rules: Vec::new(),
@@ -302,6 +314,20 @@ pub fn parse(text: &str) -> Result<Config, ConfigErrors> {
             "on-focused-monitor-changed" => config.on_focused_monitor_changed = ctx.actions(value, key),
             "on-focus-changed" => config.on_focus_changed = ctx.actions(value, key),
             "focus-follows-mouse" => config.focus_follows_mouse = ctx.bool(value, key).unwrap_or(false),
+            "animations" => config.animations = ctx.bool(value, key).unwrap_or(true),
+            "animation-duration" => {
+                let seconds = value.as_float().or_else(|| value.as_integer().map(|i| i as f64));
+                match seconds {
+                    Some(d) if d > 0.0 && d <= MAX_ANIMATION_DURATION => config.animation_duration = d,
+                    Some(_) => ctx.errors.push(
+                        key,
+                        format!("must be above 0 and at most {MAX_ANIMATION_DURATION} seconds"),
+                    ),
+                    None => ctx
+                        .errors
+                        .push(key, format!("expected a number of seconds, found {}", value.type_str())),
+                }
+            }
             "workspace-auto-back-and-forth" => {
                 config.workspace_auto_back_and_forth = ctx.bool(value, key).unwrap_or(false);
             }
