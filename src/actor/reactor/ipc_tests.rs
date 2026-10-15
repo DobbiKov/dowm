@@ -18,6 +18,11 @@ fn one_screen() -> Harness {
     h
 }
 
+/// The recorded events minus `MonitorsChanged`, which has its own tests.
+fn without_monitors(seen: &Arc<Mutex<Vec<IpcEvent>>>) -> Vec<IpcEvent> {
+    seen.lock().unwrap().iter().filter(|e| !matches!(e, IpcEvent::MonitorsChanged { .. })).cloned().collect()
+}
+
 fn query(h: &mut Harness, query: Query) -> Response {
     let (reply, rx) = mpsc::channel();
     h.send(Event::Ipc(IpcRequest::Query { query, reply }));
@@ -115,7 +120,7 @@ fn a_workspace_switch_is_published_once() {
     h.reactor.publish_ipc_changes();
     h.reactor.publish_ipc_changes();
     assert_eq!(
-        *seen.lock().unwrap(),
+        without_monitors(&seen),
         vec![IpcEvent::WorkspaceChanged { workspace: "2".into(), previous: Some("1".into()) }]
     );
 }
@@ -126,7 +131,7 @@ fn the_first_publish_announces_the_starting_workspace() {
     let seen = recording_bus(&mut h);
     h.reactor.publish_ipc_changes();
     assert_eq!(
-        *seen.lock().unwrap(),
+        without_monitors(&seen),
         vec![IpcEvent::WorkspaceChanged { workspace: "1".into(), previous: None }]
     );
 }
@@ -144,4 +149,37 @@ fn a_focus_change_is_published() {
         *seen.lock().unwrap(),
         vec![IpcEvent::FocusChanged { window: Some(wire_window_id(wid(PID, 1))) }]
     );
+}
+
+fn monitor_events(seen: &Arc<Mutex<Vec<IpcEvent>>>) -> Vec<Vec<dowm_protocol::MonitorInfo>> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            IpcEvent::MonitorsChanged { monitors } => Some(monitors.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn monitors_are_published_once_per_change() {
+    let mut h = Harness::with_workspaces(crate::model::workspace::WorkspaceConfig::numbered(4));
+    h.screens_named(&[
+        ("LEFT", 1, rect(0., 0., 1000., 800.), Some("Left")),
+        ("RIGHT", 2, rect(1000., 0., 1000., 800.), Some("Right")),
+    ]);
+    let seen = recording_bus(&mut h);
+    h.reactor.publish_ipc_changes();
+    h.reactor.publish_ipc_changes();
+    let first = monitor_events(&seen);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].len(), 2);
+    seen.lock().unwrap().clear();
+    h.cmd(Command::Workspace("3".into())).unwrap();
+    h.reactor.publish_ipc_changes();
+    h.reactor.publish_ipc_changes();
+    let changed = monitor_events(&seen);
+    assert_eq!(changed.len(), 1);
+    assert!(changed[0].iter().any(|m| m.focused && m.workspace.as_deref() == Some("3")));
 }

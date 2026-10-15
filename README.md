@@ -47,6 +47,10 @@ binary is the client:
     dowm workspace 3                              # any config command works the same
     dowm layout tiles horizontal
 
+The menu bar shows each display's workspace left to right, the focused display in brackets
+(`[1] | 3`); `subscribe workspace` also emits a `monitors-changed` event with every display's
+state whenever one changes.
+
 `exec-and-forget` is only accepted from the config file, never over the socket. Requests
 are length-framed JSON (4-byte big-endian length, 64 KiB limit); the wire types are in
 `crates/dowm-protocol` and the client library in `crates/dowm-client`.

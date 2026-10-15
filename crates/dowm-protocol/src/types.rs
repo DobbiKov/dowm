@@ -53,12 +53,14 @@ pub enum Event {
     WorkspaceChanged { workspace: String, previous: Option<String> },
     FocusChanged { window: Option<u64> },
     ModeChanged { mode: String },
+    /// Any display's workspace, the focused display, or the set of displays changed.
+    MonitorsChanged { monitors: Vec<MonitorInfo> },
 }
 
 impl Event {
     pub fn topic(&self) -> Topic {
         match self {
-            Event::WorkspaceChanged { .. } => Topic::Workspace,
+            Event::WorkspaceChanged { .. } | Event::MonitorsChanged { .. } => Topic::Workspace,
             Event::FocusChanged { .. } => Topic::Focus,
             Event::ModeChanged { .. } => Topic::Mode,
         }

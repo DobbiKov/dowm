@@ -63,6 +63,17 @@ fn every_response_round_trips() {
             }],
         },
         Response::Event { event: Event::WorkspaceChanged { workspace: "3".into(), previous: Some("2".into()) } },
+        Response::Event {
+            event: Event::MonitorsChanged {
+                monitors: vec![MonitorInfo {
+                    id: "uuid-1".into(),
+                    name: None,
+                    focused: true,
+                    workspace: Some("2".into()),
+                    frame: Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
+                }],
+            },
+        },
         Response::Event { event: Event::FocusChanged { window: Some(7) } },
         Response::Event { event: Event::ModeChanged { mode: "main".into() } },
     ];

@@ -29,6 +29,7 @@ pub(super) struct IpcState {
     bus: Option<Arc<EventBus>>,
     workspace: Option<String>,
     focus: Option<WindowId>,
+    monitors: Option<Vec<MonitorInfo>>,
 }
 
 /// The id clients see for a window: the app's pid in the high half, the per-app index
@@ -142,6 +143,11 @@ impl Reactor {
                 });
             }
             self.ipc.workspace = workspace;
+        }
+        let monitors = self.monitor_infos();
+        if self.ipc.monitors.as_ref() != Some(&monitors) {
+            self.ipc.monitors = Some(monitors.clone());
+            bus.publish(IpcEvent::MonitorsChanged { monitors });
         }
         if self.focused_window != self.ipc.focus {
             self.ipc.focus = self.focused_window;
