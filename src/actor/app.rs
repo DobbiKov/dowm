@@ -1,0 +1,2475 @@
+//! The app actor manages messaging to an application using the system
+//! accessibility APIs.
+//!
+//! These APIs support reading and writing window states like position and size.
+
+use std::cell::RefCell;
+use std::fmt::Debug;
+use std::num::NonZeroU32;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use objc2::rc::Retained;
+use objc2_app_kit::NSRunningApplication;
+use objc2_application_services::AXError;
+#[cfg(test)]
+use objc2_core_foundation::CGPoint;
+use objc2_core_foundation::CGRect;
+use serde::{Deserialize, Serialize};
+use tokio::select;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, Span, debug, info, instrument, trace, warn};
+
+use crate::actor;
+use crate::actor::reactor::transaction_manager::TransactionId;
+use crate::actor::reactor::{self, Event, Requested};
+use crate::actor::wm_controller::{self, WmEvent};
+use crate::common::collections::{HashMap, HashSet};
+use crate::model::tx_store::WindowTxStore;
+pub use crate::sys::app::{AppInfo, WindowInfo, pid_t};
+use crate::sys::app::{NSRunningApplicationExt, NativeWindowIdentity};
+use crate::sys::axuielement::{AX_STANDARD_WINDOW_SUBROLE, AXUIElement, Error as AxError};
+use crate::sys::enhanced_ui::EnhancedUi;
+use crate::sys::event;
+use crate::sys::executor::Executor;
+use crate::sys::geometry::SameAs;
+use crate::sys::observer::Observer;
+use crate::sys::process::ProcessInfo;
+use crate::sys::timer::Timer;
+use crate::sys::window_server::{self, WindowServerId, WindowServerInfo};
+
+const kAXApplicationActivatedNotification: &str = "AXApplicationActivated";
+const kAXApplicationDeactivatedNotification: &str = "AXApplicationDeactivated";
+const kAXApplicationHiddenNotification: &str = "AXApplicationHidden";
+const kAXApplicationShownNotification: &str = "AXApplicationShown";
+const kAXMainWindowChangedNotification: &str = "AXMainWindowChanged";
+const kAXWindowCreatedNotification: &str = "AXWindowCreated";
+const kAXMenuOpenedNotification: &str = "AXMenuOpened";
+const kAXMenuClosedNotification: &str = "AXMenuClosed";
+const kAXUIElementDestroyedNotification: &str = "AXUIElementDestroyed";
+const kAXWindowMovedNotification: &str = "AXWindowMoved";
+const kAXWindowResizedNotification: &str = "AXWindowResized";
+const kAXWindowMiniaturizedNotification: &str = "AXWindowMiniaturized";
+const kAXWindowDeminiaturizedNotification: &str = "AXWindowDeminiaturized";
+const kAXTitleChangedNotification: &str = "AXTitleChanged";
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum AxNotificationKind {
+    ApplicationActivated = 1,
+    ApplicationDeactivated,
+    ApplicationHidden,
+    ApplicationShown,
+    MainWindowChanged,
+    WindowCreated,
+    MenuOpened,
+    MenuClosed,
+    WindowDestroyed,
+    WindowMoved,
+    WindowResized,
+    WindowMiniaturized,
+    WindowDeminiaturized,
+    TitleChanged,
+}
+
+const APP_NOTIFICATIONS: &[(AxNotificationKind, &str)] = &[
+    (
+        AxNotificationKind::ApplicationActivated,
+        kAXApplicationActivatedNotification,
+    ),
+    (
+        AxNotificationKind::ApplicationDeactivated,
+        kAXApplicationDeactivatedNotification,
+    ),
+    (
+        AxNotificationKind::ApplicationHidden,
+        kAXApplicationHiddenNotification,
+    ),
+    (
+        AxNotificationKind::ApplicationShown,
+        kAXApplicationShownNotification,
+    ),
+    (
+        AxNotificationKind::MainWindowChanged,
+        kAXMainWindowChangedNotification,
+    ),
+    (AxNotificationKind::WindowCreated, kAXWindowCreatedNotification),
+    (AxNotificationKind::MenuOpened, kAXMenuOpenedNotification),
+    (AxNotificationKind::MenuClosed, kAXMenuClosedNotification),
+    (AxNotificationKind::TitleChanged, kAXTitleChangedNotification),
+];
+
+const WINDOW_NOTIFICATIONS: &[(AxNotificationKind, &str)] = &[
+    (
+        AxNotificationKind::WindowDestroyed,
+        kAXUIElementDestroyedNotification,
+    ),
+    (AxNotificationKind::WindowMoved, kAXWindowMovedNotification),
+    (AxNotificationKind::WindowResized, kAXWindowResizedNotification),
+    (
+        AxNotificationKind::WindowMiniaturized,
+        kAXWindowMiniaturizedNotification,
+    ),
+    (
+        AxNotificationKind::WindowDeminiaturized,
+        kAXWindowDeminiaturizedNotification,
+    ),
+];
+
+const WINDOW_ANIMATION_NOTIFICATIONS: &[AxNotificationKind] = &[
+    AxNotificationKind::WindowMoved,
+    AxNotificationKind::WindowResized,
+];
+
+/// An identifier representing a window.
+///
+/// This identifier is only valid for the lifetime of the process that owns it.
+/// It is not stable across restarts of the window manager.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct WindowId {
+    pub pid: pid_t,
+    pub idx: NonZeroU32,
+}
+
+impl serde::ser::Serialize for WindowId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::ser::Serializer {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("WindowId", 2)?;
+        s.serialize_field("pid", &self.pid)?;
+        s.serialize_field("idx", &self.idx.get())?;
+        s.end()
+    }
+}
+
+impl<'de> serde::de::Deserialize<'de> for WindowId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: serde::de::Deserializer<'de> {
+        struct WindowIdVisitor;
+        impl<'de> serde::de::Visitor<'de> for WindowIdVisitor {
+            type Value = WindowId;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(
+                    "a WindowId struct (with fields `pid` and `idx`), a tuple/seq (pid, idx), or a debug string like `WindowId { pid: 123, idx: 456 }`",
+                )
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where E: serde::de::Error {
+                WindowId::from_debug_string(v)
+                    .ok_or_else(|| E::custom("invalid WindowId debug string"))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<WindowId, A::Error>
+            where A: serde::de::SeqAccess<'de> {
+                let pid: pid_t = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+
+                let idx_u32: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+
+                let idx = std::num::NonZeroU32::new(idx_u32)
+                    .ok_or_else(|| serde::de::Error::custom("idx must be non-zero"))?;
+                Ok(WindowId { pid, idx })
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where M: serde::de::MapAccess<'de> {
+                let mut pid: Option<pid_t> = None;
+                let mut idx: Option<u32> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "pid" => {
+                            pid = Some(map.next_value()?);
+                        }
+                        "idx" => {
+                            idx = Some(map.next_value()?);
+                        }
+                        // ignore unknown fields to be forward compatible
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                let pid = pid.ok_or_else(|| serde::de::Error::missing_field("pid"))?;
+                let idx_val = idx.ok_or_else(|| serde::de::Error::missing_field("idx"))?;
+                let nz = std::num::NonZeroU32::new(idx_val)
+                    .ok_or_else(|| serde::de::Error::custom("idx must be non-zero"))?;
+
+                Ok(WindowId { pid, idx: nz })
+            }
+        }
+
+        deserializer.deserialize_any(WindowIdVisitor)
+    }
+}
+
+impl WindowId {
+    pub fn new(pid: pid_t, idx: u32) -> WindowId {
+        WindowId {
+            pid,
+            idx: NonZeroU32::new(idx).unwrap(),
+        }
+    }
+
+    /// Parse a WindowId from its string representation (format: "WindowId { pid: 123, idx: 456 }")
+    pub fn from_debug_string(s: &str) -> Option<WindowId> {
+        if !s.starts_with("WindowId { pid: ") {
+            return None;
+        }
+
+        let s = s.strip_prefix("WindowId { pid: ")?;
+        let (pid_str, rest) = s.split_once(", idx: ")?;
+        let idx_str = rest.strip_suffix(" }")?;
+
+        let pid: pid_t = pid_str.parse().ok()?;
+        let idx: u32 = idx_str.parse().ok()?;
+
+        Some(WindowId {
+            pid,
+            idx: std::num::NonZeroU32::new(idx)?,
+        })
+    }
+
+    pub fn to_debug_string(&self) -> String { format!("{:?}", self) }
+}
+
+impl AxNotificationKind {
+    fn from_tag(tag: u8) -> Option<Self> {
+        Some(match tag {
+            1 => Self::ApplicationActivated,
+            2 => Self::ApplicationDeactivated,
+            3 => Self::ApplicationHidden,
+            4 => Self::ApplicationShown,
+            5 => Self::MainWindowChanged,
+            6 => Self::WindowCreated,
+            7 => Self::MenuOpened,
+            8 => Self::MenuClosed,
+            9 => Self::WindowDestroyed,
+            10 => Self::WindowMoved,
+            11 => Self::WindowResized,
+            12 => Self::WindowMiniaturized,
+            13 => Self::WindowDeminiaturized,
+            14 => Self::TitleChanged,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ApplicationActivated => kAXApplicationActivatedNotification,
+            Self::ApplicationDeactivated => kAXApplicationDeactivatedNotification,
+            Self::ApplicationHidden => kAXApplicationHiddenNotification,
+            Self::ApplicationShown => kAXApplicationShownNotification,
+            Self::MainWindowChanged => kAXMainWindowChangedNotification,
+            Self::WindowCreated => kAXWindowCreatedNotification,
+            Self::MenuOpened => kAXMenuOpenedNotification,
+            Self::MenuClosed => kAXMenuClosedNotification,
+            Self::WindowDestroyed => kAXUIElementDestroyedNotification,
+            Self::WindowMoved => kAXWindowMovedNotification,
+            Self::WindowResized => kAXWindowResizedNotification,
+            Self::WindowMiniaturized => kAXWindowMiniaturizedNotification,
+            Self::WindowDeminiaturized => kAXWindowDeminiaturizedNotification,
+            Self::TitleChanged => kAXTitleChangedNotification,
+        }
+    }
+}
+
+fn encode_notification_data(kind: AxNotificationKind, wid: Option<WindowId>) -> usize {
+    const KIND_BITS: usize = 8;
+    let idx = wid.map_or(0, |wid| wid.idx.get()) as usize;
+    (idx << KIND_BITS) | kind as usize
+}
+
+fn decode_notification_data(
+    pid: pid_t,
+    data: usize,
+) -> Option<(AxNotificationKind, Option<WindowId>)> {
+    const KIND_MASK: usize = (1 << 8) - 1;
+    let kind = AxNotificationKind::from_tag((data & KIND_MASK) as u8)?;
+    let idx = NonZeroU32::new((data >> 8) as u32);
+    let wid = idx.map(|idx| WindowId { pid, idx });
+    Some((kind, wid))
+}
+
+#[derive(Clone)]
+pub struct AppThreadHandle {
+    requests_tx: actor::Sender<Request>,
+    interactive_frames: InteractiveFrameQueue,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FrameSource {
+    #[default]
+    Ordinary,
+    Drag,
+    Viewport,
+}
+
+#[derive(Default)]
+struct InteractiveFrames {
+    wake_pending: bool,
+    sequence: u64,
+    latest: HashMap<WindowId, (CGRect, bool, TransactionId, FrameSource, u64)>,
+}
+
+#[derive(Clone, Default)]
+#[doc(hidden)]
+/// Actor-local latest-value transport used by [`AppThreadHandle`].
+///
+/// This is public only because it is carried by the public [`Request`] enum;
+/// it is not domain state or a general-purpose queue.
+pub struct InteractiveFrameQueue(Arc<Mutex<InteractiveFrames>>);
+
+impl Debug for InteractiveFrameQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InteractiveFrameQueue(...)")
+    }
+}
+
+impl InteractiveFrameQueue {
+    pub(crate) fn drain_with(
+        &self,
+        mut consume: impl FnMut(WindowId, CGRect, bool, TransactionId, FrameSource, u64),
+    ) {
+        let mut frames = self.0.lock().unwrap();
+        frames.wake_pending = false;
+        for (wid, (frame, set_size, txid, source, sequence)) in frames.latest.drain() {
+            consume(wid, frame, set_size, txid, source, sequence);
+        }
+    }
+}
+
+#[cfg(test)]
+mod interactive_frame_tests {
+    use super::*;
+
+    #[test]
+    fn drain_keeps_capacity_and_rearms_one_wake_for_latest_frames() {
+        let (handle, mut rx) = AppThreadHandle::channel();
+        let window = WindowId::new(1, 1);
+        let first = CGRect::new(CGPoint::new(1.0, 0.0), Default::default());
+        let latest = CGRect::new(CGPoint::new(2.0, 0.0), Default::default());
+        handle.interactive_frames.0.lock().unwrap().latest.reserve(8);
+        let capacity = handle.interactive_frames.0.lock().unwrap().latest.capacity();
+
+        handle.send_interactive_frame(
+            window,
+            first,
+            true,
+            TransactionId::default(),
+            FrameSource::Drag,
+        );
+        handle.send_interactive_frame(
+            window,
+            latest,
+            false,
+            TransactionId::default(),
+            FrameSource::Drag,
+        );
+        let (_, Request::InteractiveFramesPending(queue)) = rx.try_recv().unwrap() else {
+            panic!("expected one interactive frame wake");
+        };
+        assert!(rx.try_recv().is_err());
+        let mut received = Vec::new();
+        queue.drain_with(|wid, frame, set_size, _, _, _| received.push((wid, frame, set_size)));
+        assert_eq!(received, vec![(window, latest, true)]);
+        assert_eq!(queue.0.lock().unwrap().latest.capacity(), capacity);
+
+        handle.send_interactive_frame(
+            window,
+            first,
+            false,
+            TransactionId::default(),
+            FrameSource::Drag,
+        );
+        let (_, Request::InteractiveFramesPending(old_wake)) = rx.try_recv().unwrap() else {
+            panic!("wake");
+        };
+        let through = handle.cancel_interactive_frame(window);
+        handle.send_interactive_frame(
+            window,
+            latest,
+            false,
+            TransactionId::default(),
+            FrameSource::Viewport,
+        );
+        assert!(rx.try_recv().is_err(), "reuse the outstanding wake");
+        old_wake.drain_with(|wid, frame, _, _, source, sequence| {
+            assert_eq!(wid, window);
+            assert_eq!(frame, latest);
+            assert_eq!(source, FrameSource::Viewport);
+            assert!(
+                sequence > through,
+                "old cancellation must preserve this newer frame"
+            );
+        });
+        drop(rx);
+        handle.send_interactive_frame(
+            window,
+            first,
+            false,
+            TransactionId::default(),
+            FrameSource::Viewport,
+        );
+        let pending = handle.interactive_frames.0.lock().unwrap();
+        assert!(!pending.wake_pending);
+        assert!(pending.latest.is_empty(), "shutdown must discard pending frames");
+    }
+}
+
+/// Identifies the world snapshot for which an AX window inventory was requested.
+///
+/// AX window enumeration is asynchronous and space-filtered. A response is only
+/// safe to reconcile while both this request and its topology revision are still
+/// current in the reactor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WindowInventoryToken {
+    pub request_id: u64,
+    pub topology_revision: u64,
+}
+
+impl AppThreadHandle {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(requests_tx: actor::Sender<Request>) -> Self {
+        AppThreadHandle {
+            requests_tx,
+            interactive_frames: Default::default(),
+        }
+    }
+
+    pub fn channel() -> (Self, actor::Receiver<Request>) {
+        let (requests_tx, rx) = actor::channel();
+        (
+            Self {
+                requests_tx,
+                interactive_frames: Default::default(),
+            },
+            rx,
+        )
+    }
+
+    pub(crate) fn same_actor(&self, other: &Self) -> bool {
+        self.requests_tx.same_channel(&other.requests_tx)
+    }
+
+    pub fn send(&self, req: Request) -> anyhow::Result<()> {
+        self.requests_tx.send(req);
+        Ok(())
+    }
+
+    pub(crate) fn cancel_interactive_frame(&self, wid: WindowId) -> u64 {
+        let mut frames = self.interactive_frames.0.lock().unwrap();
+        frames.latest.remove(&wid);
+        frames.sequence
+    }
+
+    pub(crate) fn cancel_window_animation(&self, wid: WindowId) {
+        let through = self.cancel_interactive_frame(wid);
+        let _ = self.send(Request::CancelWindowAnimation(wid, through));
+    }
+
+    /// Publish a high-frequency interactive frame without growing the actor queue.
+    /// Only the newest frame for each window is retained until the app actor drains it.
+    #[cfg(test)]
+    pub(crate) fn send_interactive_frame(
+        &self,
+        wid: WindowId,
+        frame: CGRect,
+        set_size: bool,
+        txid: TransactionId,
+        source: FrameSource,
+    ) {
+        self.send_interactive_frames([(wid, frame, set_size, txid, source)]);
+    }
+
+    /// Publish one application's refresh under one lock and one wake.
+    pub(crate) fn send_interactive_frames(
+        &self,
+        frames: impl IntoIterator<Item = (WindowId, CGRect, bool, TransactionId, FrameSource)>,
+    ) {
+        let mut pending = self.interactive_frames.0.lock().unwrap();
+        let mut changed = false;
+        for (wid, frame, set_size, txid, source) in frames {
+            let set_size = set_size
+                || pending
+                    .latest
+                    .get(&wid)
+                    .is_some_and(|(_, size, _, old, _)| *size && *old == source);
+            pending.sequence = pending.sequence.wrapping_add(1);
+            let sequence = pending.sequence;
+            pending.latest.insert(wid, (frame, set_size, txid, source, sequence));
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        // Enqueue the wake before releasing the publication lock. Otherwise a
+        // second producer could enqueue EndWindowAnimation ahead of this wake.
+        if !std::mem::replace(&mut pending.wake_pending, true)
+            && self
+                .requests_tx
+                .try_send(Request::InteractiveFramesPending(
+                    self.interactive_frames.clone(),
+                ))
+                .is_err()
+        {
+            pending.wake_pending = false;
+            pending.latest.clear();
+        }
+    }
+}
+
+impl Debug for AppThreadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadHandle").finish()
+    }
+}
+
+#[derive(Debug, strum_macros::IntoStaticStr)]
+pub enum Request {
+    Terminate,
+    RefreshWindowInventory(WindowInventoryToken),
+    /// Reconcile the authoritative Carbon front-process change with AX state.
+    ///
+    /// Carbon supplies the activation edge, while the app thread resolves the
+    /// focused/main window and the quiet marker before notifying the reactor.
+    ApplicationGloballyActivated(pid_t),
+    WindowMaybeDestroyed(WindowId),
+    CloseWindow(Option<WindowServerId>),
+
+    SetWindowFrames(Vec<(WindowId, CGRect)>, TransactionId, FrameMode, bool),
+    #[doc(hidden)]
+    InteractiveFramesPending(InteractiveFrameQueue),
+
+    BeginWindowAnimation(WindowId),
+    EndWindowAnimation(WindowId),
+    CancelWindowAnimation(WindowId, u64),
+
+    /// Raise the windows within a single space, in the given order. All windows must be
+    /// in the same space, or they will not be raised correctly.
+    ///
+    /// Events attributed to this request will use the provided [`Quiet`]
+    /// parameter for the last window only. Events for other windows will be
+    /// marked `Quiet::Yes` automatically.
+    Raise(Vec<WindowId>, CancellationToken, u64, Quiet),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameMode {
+    Full,
+    Position,
+}
+
+impl Request {
+    pub fn set_window_frame(wid: WindowId, frame: CGRect, txid: TransactionId, eui: bool) -> Self {
+        Self::SetWindowFrames(vec![(wid, frame)], txid, FrameMode::Full, eui)
+    }
+
+    #[inline]
+    fn disables_enhanced_ui(&self) -> bool {
+        match self {
+            Self::SetWindowFrames(_, _, _, enabled) => *enabled,
+            _ => false,
+        }
+    }
+}
+
+struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet);
+
+#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum Quiet {
+    Yes,
+    #[default]
+    No,
+}
+
+struct ExitGuard(wm_controller::Sender, pid_t, AppThreadHandle);
+impl Drop for ExitGuard {
+    fn drop(&mut self) { self.0.send(WmEvent::AppExited(self.1, self.2.clone())); }
+}
+
+pub fn spawn_app_thread(
+    pid: pid_t,
+    info: AppInfo,
+    events_tx: reactor::Sender,
+    tx_store: Option<WindowTxStore>,
+    wm_tx: wm_controller::Sender,
+    handle: AppThreadHandle,
+    requests_rx: actor::Receiver<Request>,
+) {
+    let guard = ExitGuard(wm_tx.clone(), pid, handle.clone());
+    if let Err(err) = thread::Builder::new()
+        .name(format!("{}({pid})", info.bundle_id.as_deref().unwrap_or("")))
+        .spawn(move || {
+            let _guard = guard; // Also reports early initialization failures and panics.
+            Executor::run(run_app(pid, info, events_tx, tx_store, handle, requests_rx));
+        })
+    {
+        warn!(pid, ?err, "Failed to spawn app thread");
+    }
+}
+
+struct State {
+    pid: pid_t,
+    bundle_id: Option<String>,
+    running_app: Retained<NSRunningApplication>,
+    app: AXUIElement,
+    observer: Observer,
+    events_tx: reactor::Sender,
+    windows: HashMap<WindowId, AppWindowState>,
+    elem_to_wid: HashMap<AXUIElement, WindowId>,
+    main_window: Option<WindowId>,
+    last_activated: Option<(Instant, Quiet, Option<WindowId>, oneshot::Sender<()>)>,
+    pending_activation_quiet: Option<(Instant, Quiet)>,
+    is_hidden: bool,
+    is_frontmost: bool,
+    enhanced_ui: EnhancedUi,
+    raises_tx: actor::Sender<RaiseRequest>,
+    tx_store: Option<WindowTxStore>,
+}
+
+struct AppWindowState {
+    pub elem: AXUIElement,
+    notifications_registered: bool,
+    last_seen_txid: TransactionId,
+    hidden_by_app: bool,
+    window_server_id: Option<WindowServerId>,
+    title: String,
+    is_animating: bool,
+    last_animation_frame: Option<CGRect>,
+    // Latest observed or intended geometry; only a hint for AX write ordering.
+    last_known_frame: CGRect,
+    frame_source: FrameSource,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FrameWriteOrder {
+    SizeThenPosition,
+    PositionThenSize,
+}
+
+fn frame_write_order(current: Option<CGRect>, target: CGRect) -> FrameWriteOrder {
+    let Some(current) = current else {
+        return FrameWriteOrder::SizeThenPosition;
+    };
+    if target.size.width > current.size.width + 0.5
+        || target.size.height > current.size.height + 0.5
+    {
+        FrameWriteOrder::PositionThenSize
+    } else {
+        FrameWriteOrder::SizeThenPosition
+    }
+}
+
+/// An AX window as the frame write protocol sees it.
+struct AxFrameIo<'a>(&'a AXUIElement);
+
+fn to_geo_rect(r: CGRect) -> crate::geometry::Rect {
+    crate::geometry::Rect::new(r.origin.x, r.origin.y, r.size.width, r.size.height)
+}
+
+impl crate::frame_writer::FrameIo for AxFrameIo<'_> {
+    fn set_size(&mut self, size: crate::geometry::Size) -> Result<(), String> {
+        self.0.set_size(objc2_core_foundation::CGSize::new(size.w, size.h)).map_err(|e| e.to_string())
+    }
+
+    fn set_position(&mut self, p: crate::geometry::Point) -> Result<(), String> {
+        self.0.set_position(objc2_core_foundation::CGPoint::new(p.x, p.y)).map_err(|e| e.to_string())
+    }
+
+    fn frame(&mut self) -> Result<crate::geometry::Rect, String> {
+        self.0.frame().map(to_geo_rect).map_err(|e| e.to_string())
+    }
+}
+
+/// Size, position, size; read back; retry once; accept what the app settled on.
+fn write_frame_checked(elem: &AXUIElement, target: CGRect) -> crate::frame_writer::WriteOutcome {
+    crate::frame_writer::write_frame(&mut AxFrameIo(elem), to_geo_rect(target))
+}
+
+fn write_frame(elem: &AXUIElement, current: Option<CGRect>, target: CGRect) {
+    match frame_write_order(current, target) {
+        FrameWriteOrder::SizeThenPosition => {
+            let _ = elem.set_size(target.size);
+            let _ = elem.set_position(target.origin);
+        }
+        FrameWriteOrder::PositionThenSize => {
+            let _ = elem.set_position(target.origin);
+            let _ = elem.set_size(target.size);
+        }
+    }
+}
+
+struct PendingFrame {
+    span: Span,
+    frame: CGRect,
+    set_size: bool,
+    txid: TransactionId,
+    source: FrameSource,
+    sequence: u64,
+}
+
+/// Some AX bridges (notably Qt's) surface menu elements through window discovery.
+/// They are never valid layout targets, even when they have a WindowServer peer.
+fn is_transient_menu_role(role: Option<&str>) -> bool {
+    matches!(role, Some("AXPopover" | "AXMenu" | "AXMenuItem"))
+}
+
+fn is_menu_backing_window(elem: &AXUIElement, info: &WindowInfo) -> bool {
+    if info.ax_role.as_deref() != Some("AXWindow") || info.ax_subrole.as_deref() != Some("AXDialog")
+    {
+        return false;
+    }
+
+    elem.children().is_ok_and(|children| {
+        children
+            .into_iter()
+            .any(|child| child.role().is_ok_and(|role| role == "AXMenu"))
+    })
+}
+
+impl State {
+    fn refresh_window_inventory(&mut self, token: WindowInventoryToken) -> Result<(), AxError> {
+        let window_elems = match self.app.windows() {
+            Ok(elems) => elems,
+            Err(e) => {
+                self.send_event(Event::WindowsDiscovered {
+                    pid: self.pid,
+                    token,
+                    successful: false,
+                    new: Default::default(),
+                    known_visible: Default::default(),
+                });
+                return Err(e);
+            }
+        };
+        let mut window_elems: Vec<_> = window_elems
+            .into_iter()
+            .map(|elem| (elem, NativeWindowIdentity::default()))
+            .collect();
+        let server_info_by_id = self.visible_window_server_info_map(&mut window_elems);
+        let mut new = Vec::with_capacity(window_elems.len());
+        let mut known_visible = Vec::with_capacity(window_elems.len());
+        let mut seen_wids = HashSet::default();
+
+        for (elem, mut identity) in window_elems {
+            let wsid = identity.resolve(|| WindowServerId::try_from(&elem).ok());
+            let hint = wsid.and_then(|id| server_info_by_id.get(&id).copied());
+            let mut info =
+                match WindowInfo::from_ax_element_with_identity(&elem, hint, &mut identity) {
+                    Ok((info, _)) => info,
+                    Err(err) => {
+                        let id = self.id_with_identity(&elem, &mut identity).ok();
+                        trace!(?id, ?err, "Failed to refresh window info; will retry later");
+                        continue;
+                    }
+                };
+            if self.should_ignore_window_info(&elem, &info) {
+                continue;
+            }
+            self.normalize_window_info(&elem, &mut info);
+            if !Self::has_visible_cg_peer(wsid, hint) && !info.is_minimized {
+                trace!(pid = ?self.pid, ?wsid, "Ignoring AX window without a visible CG window");
+                continue;
+            }
+
+            let Some((wid, info)) =
+                self.id_with_identity(&elem, &mut identity).ok().map(|wid| (wid, info)).or_else(
+                    || {
+                        self.register_window_with_identity(elem.clone(), hint, &mut identity)
+                            .map(|(registered_info, wid, _)| (wid, registered_info))
+                    },
+                )
+            else {
+                continue;
+            };
+
+            // AXWindows can expose the same stable WindowServer window more than once while a
+            // transient child window is being created. Reconcile each identity once per
+            // inventory so a duplicate cannot overwrite its admission classification.
+            if !seen_wids.insert(wid) {
+                continue;
+            }
+
+            // The WindowServer id is stable across sleep/display transitions, but
+            // the corresponding AXUIElement is not. `id` intentionally resolves the
+            // fresh element to the existing wid by that stable id; refresh the actor's
+            // handle as well or subsequent frame writes keep targeting the pre-wake
+            // element and can never recover.
+            self.rebind_window_element(wid, elem, &info);
+
+            if !info.is_minimized {
+                known_visible.push(wid);
+            }
+            new.push((wid, info));
+        }
+
+        self.send_event(Event::WindowsDiscovered {
+            pid: self.pid,
+            token,
+            successful: true,
+            new,
+            known_visible,
+        });
+        Ok(())
+    }
+
+    fn txid_from_store(&self, wsid: Option<WindowServerId>) -> Option<TransactionId> {
+        let store = self.tx_store.as_ref()?;
+        let wsid = wsid?;
+        let record = store.get(&wsid)?;
+        record.target.map(|_| record.txid)
+    }
+
+    fn txid_for_window_state(&self, window: &AppWindowState) -> Option<TransactionId> {
+        self.txid_from_store(window.window_server_id)
+            .or_else(|| Self::some_txid(window.last_seen_txid))
+    }
+
+    fn some_txid(txid: TransactionId) -> Option<TransactionId> {
+        if txid == TransactionId::default() {
+            None
+        } else {
+            Some(txid)
+        }
+    }
+
+    async fn run(
+        mut self,
+        info: AppInfo,
+        handle: AppThreadHandle,
+        requests_rx: actor::Receiver<Request>,
+        notifications_rx: actor::Receiver<(AXUIElement, AxNotificationKind, Option<WindowId>)>,
+        raises_rx: actor::Receiver<RaiseRequest>,
+    ) {
+        if !self.init(handle.clone(), info) {
+            return;
+        }
+
+        let this = RefCell::new(self);
+        // The raises channel is owned by State, so joining both tasks would keep
+        // the actor (and its observer) alive after the incoming task terminates.
+        select! {
+            _ = Self::handle_incoming(&this, requests_rx, notifications_rx) => {},
+            _ = Self::handle_raises(&this, raises_rx) => {},
+        }
+    }
+
+    async fn handle_incoming(
+        this: &RefCell<Self>,
+        mut requests_rx: actor::Receiver<Request>,
+        mut notifications_rx: actor::Receiver<(AXUIElement, AxNotificationKind, Option<WindowId>)>,
+    ) {
+        let mut batch = Vec::new();
+        loop {
+            select! {
+                biased;
+                req = requests_rx.recv() => {
+                    let Some(req) = req else { break };
+                    batch.push(req);
+                    while let Ok(req) = requests_rx.try_recv() {
+                        batch.push(req);
+                    }
+                }
+                notif = notifications_rx.recv() => {
+                    let Some((_, (elem, notif, hinted_wid))) = notif else { break };
+                    this.borrow_mut().handle_notification(elem, notif, hinted_wid);
+                    continue;
+                }
+            };
+            if Self::handle_request_batch(this, &mut batch) {
+                break;
+            }
+        }
+    }
+
+    fn handle_request_batch(this: &RefCell<Self>, batch: &mut Vec<(Span, Request)>) -> bool {
+        // All requests in this actor target the same application. Coalesce EUI
+        // suppression across the entire drained burst instead of toggling the
+        // app-level attribute once per window/request. Animation leases nest
+        // with this batch lease through the same refcount.
+        let disable_enhanced_ui = batch.iter().any(|(_, req)| req.disables_enhanced_ui());
+        if disable_enhanced_ui {
+            let mut state = this.borrow_mut();
+            let app = state.app.clone();
+            state.enhanced_ui.acquire(&app);
+        }
+
+        let mut pending_frames = HashMap::default();
+        let mut should_terminate = false;
+        for (span, request) in batch.drain(..) {
+            let mut state = this.borrow_mut();
+            let _guard = span.enter();
+            if !matches!(&request, Request::InteractiveFramesPending(_)) {
+                debug!(?state.bundle_id, ?state.pid, ?request, "Got request");
+            }
+            let request_kind: &'static str = (&request).into();
+            match state.handle_request(request, &mut pending_frames) {
+                Ok(true) => {
+                    should_terminate = true;
+                    break;
+                }
+                Ok(false) => (),
+                #[allow(non_upper_case_globals)]
+                Err(AxError::Ax(AXError::CannotComplete)) if state.running_app.isTerminated() => {
+                    warn!(?state.bundle_id, ?state.pid, "Application terminated without notification");
+                    should_terminate = true;
+                    break;
+                }
+                Err(err) => {
+                    warn!(?state.bundle_id, ?state.pid, request = request_kind, "Error handling request: {:?}", err);
+                }
+            }
+        }
+
+        if !should_terminate {
+            let mut state = this.borrow_mut();
+            for (wid, frame) in pending_frames {
+                if let Err(err) = state.apply_interactive_frame(wid, frame) {
+                    warn!(?wid, ?err, "Failed to apply animation frame");
+                }
+            }
+        }
+
+        if disable_enhanced_ui {
+            let mut state = this.borrow_mut();
+            let app = state.app.clone();
+            state.enhanced_ui.release(&app);
+        }
+
+        should_terminate
+    }
+
+    fn apply_interactive_frame(
+        &mut self,
+        wid: WindowId,
+        pending: PendingFrame,
+    ) -> Result<(), AxError> {
+        if crate::termination::process_shutting_down() {
+            return Ok(());
+        }
+        let PendingFrame {
+            span,
+            frame,
+            set_size,
+            txid,
+            source,
+            ..
+        } = pending;
+        let _guard = span.enter();
+        let window = self.window_mut(wid)?;
+        window.last_seen_txid = txid;
+        window.frame_source = source;
+        // Release reapplies this frame, including position-only viewport writes.
+        window.last_animation_frame = Some(frame);
+        if set_size
+            || (source != FrameSource::Drag && !window.last_known_frame.size.same_as(frame.size))
+        {
+            write_frame(&window.elem, Some(window.last_known_frame), frame);
+            window.last_known_frame = frame;
+        } else {
+            let _ = window.elem.set_position(frame.origin);
+            window.last_known_frame.origin = frame.origin;
+        }
+        Ok(())
+    }
+
+    async fn handle_raises(this: &RefCell<Self>, mut rx: actor::Receiver<RaiseRequest>) {
+        while let Some((span, raise)) = rx.recv().await {
+            let RaiseRequest(wids, token, sequence_id, quiet) = raise;
+            if let Err(e) = Self::handle_raise_request(this, &wids, &token, sequence_id, quiet)
+                .instrument(span)
+                .await
+            {
+                debug!("Raise request failed: {e:?}");
+                if matches!(
+                    e,
+                    RaiseError::AXError(AxError::NotFound)
+                        | RaiseError::AXError(AxError::Ax(AXError::InvalidUIElement))
+                ) {
+                    this.borrow()
+                        .send_event(Event::RaiseTargetsMissing { windows: wids, sequence_id });
+                }
+            }
+        }
+    }
+
+    #[instrument(skip_all, fields(?info))]
+    #[must_use]
+    fn init(&mut self, handle: AppThreadHandle, info: AppInfo) -> bool {
+        let extended_timeout_prefixes = ["com.jetbrains.", "org.gnu.Emacs"];
+        let timeout = Instant::now()
+            + match info.bundle_id.as_deref() {
+                Some(id)
+                    if extended_timeout_prefixes.iter().any(|prefix| id.starts_with(prefix)) =>
+                {
+                    Duration::from_secs(60)
+                }
+
+                _ => Duration::ZERO,
+            };
+        let mut sleep_dur = Duration::from_millis(20);
+        let mut sleep = || {
+            let now = Instant::now();
+            let Some(remaining) = timeout.checked_duration_since(now) else {
+                return false;
+            };
+            thread::sleep(Duration::min(sleep_dur, remaining));
+            sleep_dur = Duration::min(sleep_dur * 2, Duration::from_secs(1));
+            true
+        };
+        for &(kind, notif) in APP_NOTIFICATIONS {
+            // App-level notifications are not tied to a specific window, but the
+            // observer callback still recovers the notification kind by decoding
+            // the refcon hint (see `decode_notification_data`). Registering with the
+            // plain `add_notification` would attach a zero hint, which decodes to an
+            // invalid tag and causes the notification to be silently dropped - so
+            // encode the kind here just like the per-window registrations do.
+            let data = encode_notification_data(kind, None);
+            loop {
+                match self.observer.add_notification_with_data(&self.app, notif, data) {
+                    Ok(()) => break,
+                    #[allow(non_upper_case_globals)]
+                    Err(AxError::Ax(AXError::NotificationAlreadyRegistered)) => {
+                        debug!(
+                            pid = ?self.pid,
+                            "Watching app for {notif} was already registered; continuing"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        debug!(pid = ?self.pid, ?err, "Watching app for {notif} failed");
+                        if !sleep() {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut initial_window_elements: Vec<_> = self
+            .app
+            .windows()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|elem| (elem, NativeWindowIdentity::default()))
+            .collect();
+        let server_info_by_id = self.visible_window_server_info_map(&mut initial_window_elements);
+
+        let window_count = initial_window_elements.len();
+        self.windows.reserve(window_count);
+        self.elem_to_wid.reserve(window_count);
+        let mut windows = Vec::with_capacity(window_count);
+        let mut window_server_info = Vec::with_capacity(window_count);
+
+        for (elem, mut identity) in initial_window_elements {
+            let wsid = identity.resolve(|| WindowServerId::try_from(&elem).ok());
+            let hint = wsid.and_then(|id| server_info_by_id.get(&id).copied());
+            if let Some(info) = hint {
+                window_server_info.push(info);
+            }
+            if !Self::has_visible_cg_peer(wsid, hint) {
+                trace!(pid = ?self.pid, ?wsid, "Ignoring AX window without a visible CG window");
+                continue;
+            }
+            let Some((info, wid, _)) =
+                self.register_window_with_identity(elem, hint, &mut identity)
+            else {
+                continue;
+            };
+            windows.push((wid, info));
+        }
+
+        self.main_window = self.app.main_window().ok().and_then(|w| self.id(&w).ok());
+        self.is_frontmost = self.app.frontmost().unwrap_or(false);
+
+        self.events_tx.send(Event::ApplicationLaunched {
+            pid: self.pid,
+            handle,
+            info,
+            is_frontmost: self.is_frontmost,
+            main_window: self.main_window,
+            visible_windows: windows,
+            window_server_info,
+        });
+
+        true
+    }
+
+    #[instrument(skip_all, fields(app = ?self.app, ?request))]
+    fn handle_request(
+        &mut self,
+        request: Request,
+        pending_frames: &mut HashMap<WindowId, PendingFrame>,
+    ) -> Result<bool, AxError> {
+        match request {
+            Request::Terminate => {
+                return Ok(true);
+            }
+            Request::WindowMaybeDestroyed(wid) => {
+                if wid.pid != self.pid {
+                    return Ok(false);
+                }
+
+                // If we don't know this window, nothing to verify.
+                if !self.windows.contains_key(&wid) {
+                    return Ok(false);
+                }
+
+                // Destruction is verified by the reactor's revisioned inventory
+                // coordinator. Do not enumerate AX windows independently here.
+                self.send_event(Event::WindowInventoryRefreshRequested(self.pid));
+                return Ok(false);
+            }
+            Request::CloseWindow(window_server_id) => {
+                if let Some(wsid) = window_server_id
+                    && let Err(err) = window_server::make_key_window(self.pid, wsid)
+                {
+                    warn!(pid = self.pid, ?wsid, ?err, "Failed to focus close target");
+                    return Ok(false);
+                }
+                if !event::post_command_w(self.pid) {
+                    warn!(pid = self.pid, ?window_server_id, "Failed to post Command-W");
+                }
+            }
+            Request::RefreshWindowInventory(token) => {
+                self.refresh_window_inventory(token)?;
+            }
+            Request::ApplicationGloballyActivated(pid) => {
+                if pid == self.pid {
+                    self.on_global_activation()?;
+                }
+            }
+            Request::InteractiveFramesPending(frames) => {
+                frames.drain_with(|wid, frame, set_size, txid, source, sequence| {
+                    pending_frames.insert(wid, PendingFrame {
+                        span: Span::current(),
+                        frame,
+                        set_size,
+                        txid,
+                        source,
+                        sequence,
+                    });
+                });
+            }
+            Request::SetWindowFrames(frames, txid, mode, _) => {
+                for (wid, desired) in frames {
+                    if crate::termination::process_shutting_down() {
+                        break; // the restore has begun; a late write could re-park a window
+                    }
+                    let elem = match self.window_mut(wid) {
+                        Ok(window) => {
+                            window.last_seen_txid = txid;
+                            window.frame_source = FrameSource::Ordinary;
+                            window.elem.clone()
+                        }
+                        Err(err) => match err {
+                            AxError::Ax(code) => {
+                                if self.handle_ax_error(wid, &code) {
+                                    continue;
+                                }
+                                return Err(AxError::Ax(code));
+                            }
+                            AxError::NotFound => continue,
+                        },
+                    };
+
+                    let window = self.window_mut(wid)?;
+                    if mode == FrameMode::Position {
+                        // Workspace switches: size, position, size, verified, so an app
+                        // that clamps on move cannot leave a window mis-sized or half parked.
+                        // The size is the plan's (`desired`), not the actor's possibly
+                        // stale last-known size.
+                        let outcome = write_frame_checked(&elem, desired);
+                        if !outcome.is_exact() {
+                            warn!(?wid, ?outcome, "app did not take the requested position");
+                        }
+                        window.last_known_frame = desired;
+                    } else {
+                        write_frame(&elem, Some(window.last_known_frame), desired);
+                        window.last_known_frame = desired;
+                    }
+
+                    let frame =
+                        match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
+                            Some(frame) => {
+                                self.window_mut(wid)?.last_known_frame = frame;
+                                frame
+                            }
+                            None => continue,
+                        };
+
+                    self.send_event(Event::WindowFrameChanged(
+                        wid,
+                        frame,
+                        Some(txid),
+                        Requested(true),
+                        None,
+                    ));
+                }
+            }
+            Request::BeginWindowAnimation(wid) => {
+                let (elem, started_animation) = {
+                    let window = self.window_mut(wid)?;
+                    let started_animation = !std::mem::replace(&mut window.is_animating, true);
+                    if started_animation {
+                        window.last_animation_frame = None;
+                    }
+                    (window.elem.clone(), started_animation)
+                };
+                if started_animation {
+                    let app = self.app.clone();
+                    self.enhanced_ui.acquire(&app);
+                    self.stop_notifications_for_animation(&elem);
+                }
+            }
+            request @ (Request::EndWindowAnimation(_) | Request::CancelWindowAnimation(..)) => {
+                let (wid, through) = match request {
+                    Request::EndWindowAnimation(wid) => (wid, None),
+                    Request::CancelWindowAnimation(wid, through) => (wid, Some(through)),
+                    _ => unreachable!(),
+                };
+                if let Some(through) = through {
+                    if pending_frames.get(&wid).is_some_and(|frame| frame.sequence <= through) {
+                        pending_frames.remove(&wid);
+                    }
+                    if let Ok(window) = self.window_mut(wid) {
+                        window.last_animation_frame = None;
+                    }
+                }
+                if through.is_none()
+                    && let Some(frame) = pending_frames.remove(&wid)
+                    && let Err(err) = self.apply_interactive_frame(wid, frame)
+                {
+                    warn!(?wid, ?err, "Failed to flush animation frame on end");
+                }
+                let (elem, last_seen_txid, last_animation_frame, ended_animation) = match self
+                    .window_mut(wid)
+                {
+                    Ok(window) => {
+                        window.frame_source = FrameSource::Ordinary;
+                        let ended_animation = std::mem::replace(&mut window.is_animating, false);
+                        (
+                            window.elem.clone(),
+                            window.last_seen_txid,
+                            window.last_animation_frame.take(),
+                            ended_animation,
+                        )
+                    }
+                    Err(err) => match err {
+                        AxError::Ax(code) => {
+                            if self.handle_ax_error(wid, &code) {
+                                return Ok(false);
+                            }
+                            return Err(AxError::Ax(code));
+                        }
+                        AxError::NotFound => return Ok(false),
+                    },
+                };
+                // A newer target may already be in the shared store. Report the
+                // transaction actually written by this actor, including on normal end.
+                let txid = Self::some_txid(last_seen_txid);
+                if ended_animation {
+                    let app = self.app.clone();
+                    self.enhanced_ui.release(&app);
+                    self.restart_notifications_after_animation(&elem);
+                }
+                let mut frame =
+                    match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
+                        Some(frame) => frame,
+                        None => return Ok(false),
+                    };
+                // Intermediate AX writes can be clamped while a growing column
+                // still overlaps the screen edge. The intended-frame cache is
+                // only a hint: repair against observed geometry once motion ends.
+                if let Some(target) = last_animation_frame
+                    && !frame.same_as(target)
+                {
+                    if frame.size.same_as(target.size) {
+                        let _ = elem.set_position(target.origin);
+                    } else {
+                        write_frame(&elem, Some(frame), target);
+                    }
+                    frame =
+                        match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
+                            Some(frame) => frame,
+                            None => return Ok(false),
+                        };
+                }
+                self.window_mut(wid)?.last_known_frame = frame;
+                self.send_event(Event::WindowFrameChanged(
+                    wid,
+                    frame,
+                    txid,
+                    Requested(true),
+                    None,
+                ));
+            }
+            Request::Raise(wids, token, sequence_id, quiet) => {
+                self.raises_tx.send(RaiseRequest(wids, token, sequence_id, quiet));
+            }
+        }
+        Ok(false)
+    }
+
+    #[instrument(skip_all, fields(app = ?self.app, ?notif))]
+    fn handle_notification(
+        &mut self,
+        elem: AXUIElement,
+        notif: AxNotificationKind,
+        hinted_wid: Option<WindowId>,
+    ) {
+        trace!(?notif, ?elem, "Got notification");
+        match notif {
+            AxNotificationKind::ApplicationHidden => self.on_application_hidden(),
+            AxNotificationKind::ApplicationShown => self.on_application_shown(),
+            AxNotificationKind::ApplicationActivated
+            | AxNotificationKind::ApplicationDeactivated => _ = self.on_ax_activation_changed(),
+            AxNotificationKind::MainWindowChanged => {
+                // `AXWindows` is filtered to the current macOS space, so using it as
+                // a membership list here will incorrectly "destroy" windows that
+                // merely live on another space. This fallback therefore only prunes
+                // windows whose AX element has actually gone invalid.
+                self.remove_stale_windows();
+                // Some apps (notably Java-based ones like IBKR) can report a new
+                // main window before AXWindowCreated or before we have fully
+                // registered it. Treat main-window changes as a valid discovery
+                // path so the new primary window gets tracked immediately.
+                self.on_main_window_changed(None, true);
+            }
+            AxNotificationKind::WindowCreated => {
+                if self.id(&elem).is_ok() {
+                    return;
+                }
+                let Some((window, wid, window_server_info)) = self.register_window(elem, None)
+                else {
+                    return;
+                };
+                let window_server_info = window_server_info
+                    .or_else(|| window.sys_id.and_then(window_server::get_window));
+                self.send_event(Event::WindowCreated(
+                    wid,
+                    window,
+                    window_server_info,
+                    event::get_mouse_state(),
+                ));
+            }
+            AxNotificationKind::MenuOpened => self.send_event(Event::MenuOpened(self.pid)),
+            AxNotificationKind::MenuClosed => self.send_event(Event::MenuClosed(self.pid)),
+            AxNotificationKind::WindowDestroyed => {
+                #[cfg(feature = "disable-axuielement-destroyed")]
+                return;
+                #[cfg(not(feature = "disable-axuielement-destroyed"))]
+                {
+                    let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
+                        return;
+                    };
+                    // A refreshed AXUIElement can reuse the same stable WindowServer-backed
+                    // WindowId. Removing by the callback's encoded wid would then let a late
+                    // destroy notification for the superseded element tear down the replacement.
+                    // Only the element currently bound to this wid owns its lifetime.
+                    if !self.is_current_window_element(wid, &elem) {
+                        trace!(?wid, "Ignoring destroy notification for superseded AX element");
+                        return;
+                    }
+                    if self.remove_window(wid).is_none() {
+                        return;
+                    }
+                    self.send_event(Event::WindowInvalidated(
+                        wid,
+                        crate::actor::reactor::WindowInvalidationSource::AxDestroyedNotification,
+                    ));
+
+                    self.on_main_window_changed(Some(wid), false);
+                }
+            }
+            AxNotificationKind::WindowMoved | AxNotificationKind::WindowResized => {
+                let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
+                    return;
+                };
+                if !self.is_current_window_element(wid, &elem) {
+                    trace!(?wid, ?notif, "Ignoring notification for superseded AX element");
+                    return;
+                }
+
+                let (txid, source) = match self.window(wid) {
+                    Ok(window) => {
+                        if window.is_animating || window.frame_source == FrameSource::Viewport {
+                            trace!(?wid, ?notif, "Ignoring notification during owned frame writes");
+                            return;
+                        }
+                        (self.txid_for_window_state(window), window.frame_source)
+                    }
+                    Err(err) => {
+                        match err {
+                            AxError::Ax(code) => {
+                                if self.handle_ax_error(wid, &code) {
+                                    return;
+                                }
+                            }
+                            AxError::NotFound => {}
+                        }
+                        return;
+                    }
+                };
+                let mouse_state = event::get_mouse_state();
+                if source == FrameSource::Drag && mouse_state == Some(event::MouseState::Down) {
+                    trace!(?wid, ?notif, "Ignoring interactive drag notification");
+                    return;
+                }
+                if let Some(window) = self.windows.get_mut(&wid) {
+                    window.frame_source = FrameSource::Ordinary;
+                }
+                let frame = match elem.frame() {
+                    Ok(frame) => frame,
+                    // During display teardown, macOS can send AXWindowMoved after
+                    // the old AX element has been invalidated. This is not a
+                    // destruction notification. Only AXUIElementDestroyed is
+                    // authoritative for removing the app's window record; treating
+                    // this transient read failure as a destroy drops manual
+                    // workspace ownership before the window is rediscovered.
+                    Err(AxError::Ax(AXError::InvalidUIElement)) => {
+                        trace!(
+                            ?wid,
+                            ?notif,
+                            "Ignoring invalid AX element from move/resize notification"
+                        );
+                        return;
+                    }
+                    Err(AxError::Ax(AXError::CannotComplete)) => return,
+                    Err(err) => {
+                        debug!(?wid, ?err, "Failed to read frame for window");
+                        return;
+                    }
+                };
+                if let Some(window) = self.windows.get_mut(&wid) {
+                    window.last_known_frame = frame;
+                }
+                self.send_event(Event::WindowFrameChanged(
+                    wid,
+                    frame,
+                    txid,
+                    Requested(false),
+                    mouse_state,
+                ));
+            }
+            AxNotificationKind::WindowMiniaturized => {
+                let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
+                    return;
+                };
+                let Some(window) = self.windows.get_mut(&wid).filter(|window| window.elem == elem)
+                else {
+                    trace!(?wid, "Ignoring miniaturize for superseded AX element");
+                    return;
+                };
+                window.hidden_by_app = false;
+                self.send_event(Event::WindowMinimized(wid));
+            }
+            AxNotificationKind::WindowDeminiaturized => {
+                let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
+                    return;
+                };
+                let Some(window) = self.windows.get_mut(&wid).filter(|window| window.elem == elem)
+                else {
+                    trace!(?wid, "Ignoring deminiaturize for superseded AX element");
+                    return;
+                };
+                window.hidden_by_app = false;
+                self.send_event(Event::WindowDeminiaturized(wid));
+            }
+            AxNotificationKind::TitleChanged => {
+                let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
+                    return;
+                };
+                if !self.is_current_window_element(wid, &elem) {
+                    trace!(?wid, "Ignoring title change for superseded AX element");
+                    return;
+                }
+                let wsid = self.windows.get(&wid).and_then(|window| window.window_server_id);
+                let sls_title = wsid
+                    .and_then(window_server::window_title)
+                    .filter(|(pid, _)| *pid == self.pid)
+                    .map(|(_, title)| title);
+                match sls_title.map(Ok).unwrap_or_else(|| elem.title()) {
+                    Ok(title) => {
+                        let Ok(window) = self.window_mut(wid) else {
+                            return;
+                        };
+                        if window.title == title {
+                            return;
+                        }
+                        window.title = title.clone();
+                        self.send_event(Event::WindowTitleChanged(wid, title));
+                    }
+                    Err(err) => debug!(
+                        ?wid,
+                        ?err,
+                        "Failed to read title for WindowTitleChanged notification"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code, reason = "uesed by Debug impls")]
+enum RaiseError {
+    RaiseCancelled,
+    AXError(AxError),
+}
+
+impl From<AxError> for RaiseError {
+    fn from(value: AxError) -> Self { Self::AXError(value) }
+}
+
+impl State {
+    // The `RefMut` is moved into `wait_for_activation`, which drops it before awaiting.
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn handle_raise_request(
+        this_ref: &RefCell<Self>,
+        wids: &[WindowId],
+        token: &CancellationToken,
+        sequence_id: u64,
+        quiet: Quiet,
+    ) -> Result<(), RaiseError> {
+        let check_cancel = || {
+            if token.is_cancelled() {
+                return Err(RaiseError::RaiseCancelled);
+            }
+            Ok(())
+        };
+        check_cancel()?;
+
+        let Some(&first) = wids.first() else {
+            warn!("Got empty list of wids to raise; this might misbehave");
+            return Ok(());
+        };
+        let is_standard = {
+            let this = this_ref.borrow();
+            let window = this.window(first)?;
+            window.elem.subrole().map(|s| s == AX_STANDARD_WINDOW_SUBROLE).unwrap_or(false)
+        };
+
+        check_cancel()?;
+
+        static MUTEX: LazyLock<parking_lot::Mutex<()>> =
+            LazyLock::new(|| parking_lot::Mutex::new(()));
+        let mut mutex_guard = Some(MUTEX.lock());
+        check_cancel()?;
+        let mut this = this_ref.borrow_mut();
+
+        let is_frontmost = trace("is_frontmost", &this.app, || this.app.frontmost())?;
+
+        // Focus-follows-mouse can enqueue a final hover transition while the
+        // pointer is moving off a window (for example, into the menu bar).
+        // Reissuing make-key/raise for the window that is already focused is
+        // not only redundant: it can visibly pulse focus and pull it back from
+        // transient system UI. Complete the request without touching focus.
+        //
+        // Only elide a single-window request. Multi-window batches still need
+        // their raises to establish the requested stacking order.
+        if is_frontmost && this.main_window == Some(first) && wids.len() == 1 {
+            trace!(?first, "Skipping raise for already focused window");
+            this.send_event(Event::RaiseCompleted { window_id: first, sequence_id });
+            return Ok(());
+        }
+
+        let window_server_id = match WindowServerId::try_from(&this.window(first)?.elem) {
+            Ok(wsid) => Some(wsid),
+            Err(AxError::NotFound) => {
+                debug!(
+                    ?first,
+                    "Skipping make-key request because window has no server id yet"
+                );
+                None
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let make_key_result =
+            window_server_id.map(|wsid| window_server::make_key_window(this.pid, wsid));
+        if let Some(Err(err)) = &make_key_result {
+            warn!(?this.pid, ?err, "Failed to activate app");
+        }
+
+        let waits_for_activation =
+            !is_frontmost && make_key_result.as_ref().is_some_and(Result::is_ok) && is_standard;
+        if waits_for_activation {
+            // Keep the WindowServer make-key request and AX raise adjacent, matching
+            // yabai's focus ordering. If we wait for process activation first, macOS
+            // can temporarily make the application's previous key window authoritative.
+            // For apps with windows on multiple displays that produces a spurious
+            // active-display hop before the requested window is finally raised.
+            //
+            // This deliberately starts the focus operation before the cancellable
+            // activation wait. Cancellation can stop follow-up batch raises, but it
+            // must not leave process activation detached from its target window.
+            let window = this.window(first)?;
+            trace("raise before activation wait", &window.elem, || {
+                window.elem.raise()
+            })?;
+
+            if wids.len() == 1 {
+                // `quiet` only applies if the first window is also the last.
+                let quiet_window_change = (quiet == Quiet::Yes).then_some(first);
+                Self::wait_for_activation(this, quiet, quiet_window_change, &token).await?;
+            } else {
+                // Windows before the last are always quiet.
+                Self::wait_for_activation(this, Quiet::Yes, Some(first), &token).await?;
+            }
+            this = this_ref.borrow_mut();
+        } else {
+            trace!(
+                "Not awaiting activation event. is_frontmost={is_frontmost:?} \
+                make_key_result={make_key_result:?} is_standard={is_standard:?}"
+            )
+        }
+
+        for (i, &wid) in wids.iter().enumerate() {
+            debug_assert_eq!(wid.pid, this.pid);
+            if waits_for_activation && i == 0 {
+                trace!(?wid, "Skipping duplicate raise after activation wait");
+            } else {
+                let window = this.window(wid)?;
+                trace("raise", &window.elem, || window.elem.raise())?;
+            }
+
+            // TODO: Check the frontmost (layer 0) window of the window server and retry if necessary.
+
+            trace!("Sending completion");
+            this.send_event(Event::RaiseCompleted { window_id: wid, sequence_id });
+
+            let is_last = i + 1 == wids.len();
+            let quiet_if = if is_last {
+                mutex_guard.take();
+                (quiet == Quiet::Yes).then_some(wid)
+            } else {
+                None
+            };
+
+            if is_last {
+                let main_window = this.on_main_window_changed(quiet_if, true);
+                if main_window != Some(wid) {
+                    warn!(
+                        "Raise request failed to raise {desired:?}; instead got main_window={main_window:?}",
+                        desired = this.window(wid).map(|w| &w.elem).ok(),
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn on_main_window_changed(
+        &mut self,
+        quiet_if: Option<WindowId>,
+        allow_register: bool,
+    ) -> Option<WindowId> {
+        let elem = match trace("main_window", &self.app, || self.app.main_window()) {
+            Ok(elem) => elem,
+            Err(e) => {
+                if self.windows.is_empty() {
+                    trace!("Failed to read main window (no windows): {e:?}");
+                } else {
+                    warn!("Failed to read main window: {e:?}");
+                }
+                return None;
+            }
+        };
+
+        let wid = match self.id(&elem).ok() {
+            Some(wid) => wid,
+            None => {
+                if !allow_register {
+                    info!(?self.pid, "Got MainWindowChanged on unknown window; clearing main window");
+                    if self.main_window.take().is_some() {
+                        self.send_event(Event::ApplicationMainWindowChanged(
+                            self.pid,
+                            None,
+                            Quiet::No,
+                        ));
+                    }
+                    return None;
+                }
+                let Some((info, wid, window_server_info)) = self.register_window(elem, None) else {
+                    debug!(?self.pid, "Got MainWindowChanged on unknown window");
+                    return None;
+                };
+                let window_server_info =
+                    window_server_info.or_else(|| info.sys_id.and_then(window_server::get_window));
+                self.send_event(Event::WindowCreated(
+                    wid,
+                    info,
+                    window_server_info,
+                    event::get_mouse_state(),
+                ));
+                wid
+            }
+        };
+
+        if self.main_window == Some(wid) {
+            return Some(wid);
+        }
+        self.main_window = Some(wid);
+        let quiet = match quiet_if {
+            Some(id) if id == wid => Quiet::Yes,
+            _ => Quiet::No,
+        };
+        self.send_event(Event::ApplicationMainWindowChanged(self.pid, Some(wid), quiet));
+        Some(wid)
+    }
+
+    fn take_activation_context(&mut self) -> (Quiet, Option<WindowId>) {
+        match self.last_activated.take() {
+            Some((ts, quiet_activation, quiet_window_change, tx)) => {
+                _ = tx.send(());
+                if ts.elapsed() < Duration::from_millis(1000) {
+                    trace!("by us");
+                    (quiet_activation, quiet_window_change)
+                } else {
+                    trace!("by user");
+                    (Quiet::No, None)
+                }
+            }
+            None => {
+                trace!("by user");
+                (Quiet::No, None)
+            }
+        }
+    }
+
+    fn on_ax_activation_changed(&mut self) -> Result<(), AxError> {
+        let is_frontmost = trace("is_frontmost", &self.app, || self.app.frontmost())?;
+        let old_frontmost = std::mem::replace(&mut self.is_frontmost, is_frontmost);
+        debug!(
+            "on_ax_activation_changed, pid={:?}, is_frontmost={:?}, old_frontmost={:?}",
+            self.pid, is_frontmost, old_frontmost
+        );
+
+        if !is_frontmost {
+            self.pending_activation_quiet = None;
+            if old_frontmost {
+                self.send_event(Event::ApplicationDeactivated(self.pid));
+            }
+        } else if !old_frontmost {
+            let (quiet, quiet_window_change) = self.take_activation_context();
+            self.on_main_window_changed(quiet_window_change, true);
+            self.pending_activation_quiet = Some((Instant::now(), quiet));
+        }
+        Ok(())
+    }
+
+    fn on_global_activation(&mut self) -> Result<(), AxError> {
+        let (quiet, quiet_window_change) = if self.last_activated.is_some() {
+            self.take_activation_context()
+        } else if let Some((ts, quiet)) = self.pending_activation_quiet.take()
+            && ts.elapsed() < Duration::from_millis(1000)
+        {
+            (quiet, None)
+        } else {
+            (Quiet::No, None)
+        };
+
+        // Carbon is the authoritative inter-application activation edge. AX
+        // frontmost polling/notifications can lag it, so do not reject this
+        // request based on a transient AX value.
+        self.is_frontmost = true;
+        if self.on_main_window_changed(quiet_window_change, true).is_none()
+            && self.main_window.take().is_some()
+        {
+            // Do not let the reactor reuse a previous window as the target for
+            // this authoritative activation when AX cannot resolve the current
+            // main window. This event is queued before ApplicationActivated.
+            self.send_event(Event::ApplicationMainWindowChanged(self.pid, None, Quiet::No));
+        }
+        self.send_event(Event::ApplicationActivated(self.pid, quiet));
+        Ok(())
+    }
+
+    // `this` is dropped before the first await.
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn wait_for_activation(
+        mut this: std::cell::RefMut<'_, Self>,
+        quiet_activation: Quiet,
+        quiet_window_change: Option<WindowId>,
+        token: &CancellationToken,
+    ) -> Result<(), RaiseError> {
+        let app = this.app.clone();
+        let (tx, rx) = oneshot::channel();
+        if let Some((_, _, _, prev_tx)) =
+            this.last_activated
+                .replace((Instant::now(), quiet_activation, quiet_window_change, tx))
+        {
+            let _ = prev_tx.send(());
+        }
+        drop(this);
+        trace!("Awaiting activation");
+        tokio::pin!(rx);
+        loop {
+            select! {
+                _ = &mut rx => break,
+                _ = token.cancelled() => {
+                    debug!("Raise cancelled while awaiting activation event");
+                    return Err(RaiseError::RaiseCancelled);
+                }
+                _ = Timer::sleep(Duration::from_millis(10)) => {
+                    if app.frontmost().unwrap_or(false) {
+                        trace!("Activation observed via frontmost polling");
+                        break;
+                    }
+                }
+            }
+        }
+        trace!("Activation complete");
+        Ok(())
+    }
+
+    fn on_application_hidden(&mut self) {
+        if self.is_hidden {
+            return;
+        }
+
+        self.is_hidden = true;
+        let mut to_minimize = Vec::new();
+        for (wid, window) in self.windows.iter_mut() {
+            if window.hidden_by_app {
+                continue;
+            }
+            window.hidden_by_app = true;
+            to_minimize.push(*wid);
+        }
+
+        for wid in to_minimize {
+            self.send_event(Event::WindowMinimized(wid));
+        }
+    }
+
+    fn on_application_shown(&mut self) {
+        if !self.is_hidden {
+            return;
+        }
+
+        self.is_hidden = false;
+        let mut to_restore = Vec::new();
+        for (wid, window) in self.windows.iter_mut() {
+            if !window.hidden_by_app {
+                continue;
+            }
+            window.hidden_by_app = false;
+            let minimized = match trace("minimized", &window.elem, || window.elem.minimized()) {
+                Ok(minimized) => minimized,
+                Err(err) => {
+                    debug!(?wid, ?err, "Failed to read minimized state after app shown");
+                    false
+                }
+            };
+            if minimized {
+                continue;
+            }
+            let wid = *wid;
+            to_restore.push(wid);
+        }
+
+        for wid in to_restore {
+            self.send_event(Event::WindowDeminiaturized(wid));
+        }
+    }
+
+    #[must_use]
+    fn register_window(
+        &mut self,
+        elem: AXUIElement,
+        server_info_hint: Option<WindowServerInfo>,
+    ) -> Option<(WindowInfo, WindowId, Option<WindowServerInfo>)> {
+        self.register_window_with_identity(
+            elem,
+            server_info_hint,
+            &mut NativeWindowIdentity::default(),
+        )
+    }
+
+    fn register_window_with_identity(
+        &mut self,
+        elem: AXUIElement,
+        server_info_hint: Option<WindowServerInfo>,
+        identity: &mut NativeWindowIdentity,
+    ) -> Option<(WindowInfo, WindowId, Option<WindowServerInfo>)> {
+        // Resolve the WindowServer id before building the WindowInfo so that
+        // every id-derived field (sys_id, is_root, min/max size, bundle path)
+        // is computed from the same identity that keys the window.
+        //
+        // An AX window that does not resolve to a WindowServer window cannot be
+        // tracked through any of the WindowServer paths (space membership,
+        // WindowServerDestroyed, transactions) and would bypass every
+        // layer/level filter that keys on the id. System HUDs such as Control
+        // Center's volume bezel report AXWindowCreated with window number 0
+        // before (or without) a backing CG window. A later eligible
+        // WindowServerAppeared for the app requests an inventory refresh;
+        // registration then succeeds if AX exposes the window with a native
+        // id by that point.
+        let Some(window_server_id) = server_info_hint
+            .map(|hint| hint.id)
+            .filter(|id| id.as_nonzero().is_some())
+            .or_else(|| identity.resolve(|| WindowServerId::try_from(&elem).ok()))
+        else {
+            debug!(pid = ?self.pid, ?elem, "Ignoring AX window without a WindowServer id");
+            return None;
+        };
+        let idx = window_server_id.as_nonzero()?;
+
+        let Ok((mut info, server_info)) =
+            WindowInfo::from_ax_element_with_identity(&elem, server_info_hint, identity)
+        else {
+            return None;
+        };
+        if !Self::has_visible_cg_peer(info.sys_id, server_info) && !info.is_minimized {
+            trace!(pid = ?self.pid, sys_id = ?info.sys_id, "Ignoring AX window without a visible CG window");
+            return None;
+        }
+
+        if self.should_ignore_window_info(&elem, &info) {
+            return None;
+        }
+
+        self.normalize_window_info(&elem, &mut info);
+
+        let wid = WindowId { pid: self.pid, idx };
+        if self.windows.contains_key(&wid) {
+            trace!(?wid, "Window already registered; skipping duplicate");
+            return None;
+        }
+
+        // Some applications expose real WindowServer-backed windows through a
+        // non-AXWindow element (for example Emacs reports AXTextField). Keep
+        // those elements registered even when per-window AX notifications are
+        // unavailable; app-level discovery remains the lifecycle fallback.
+        let notifications_registered = self.register_window_notifications(&elem, wid);
+        let hidden_by_app = self.is_hidden;
+        let last_seen_txid = self.txid_from_store(Some(window_server_id)).unwrap_or_default();
+
+        let old = self.windows.insert(wid, AppWindowState {
+            elem: elem.clone(),
+            notifications_registered,
+            last_seen_txid,
+            hidden_by_app,
+            window_server_id: Some(window_server_id),
+            title: info.title.clone(),
+            is_animating: false,
+            last_animation_frame: None,
+            last_known_frame: info.frame,
+            frame_source: FrameSource::Ordinary,
+        });
+        debug_assert!(old.is_none(), "Duplicate window id {wid:?}");
+        self.elem_to_wid.insert(elem, wid);
+        if hidden_by_app {
+            self.send_event(Event::WindowMinimized(wid));
+        }
+        Some((info, wid, server_info))
+    }
+
+    fn register_window_notifications(&self, elem: &AXUIElement, wid: WindowId) -> bool {
+        let mut registered_all = true;
+        for &(kind, notif) in WINDOW_NOTIFICATIONS {
+            let res = self.observer.add_notification_with_data(
+                elem,
+                notif,
+                encode_notification_data(kind, Some(wid)),
+            );
+            if let Err(err) = res {
+                let is_already_registered = matches!(
+                    err,
+                    AxError::Ax(code) if code == AXError::NotificationAlreadyRegistered
+                );
+                if !is_already_registered {
+                    trace!("Watching failed with error {err:?} on window {elem:#?}");
+                    registered_all = false;
+                }
+            }
+        }
+        registered_all
+    }
+
+    fn rebind_window_element(&mut self, wid: WindowId, elem: AXUIElement, info: &WindowInfo) {
+        let Some((old_elem, was_animating, old_notifications_registered)) =
+            self.windows.get(&wid).map(|window| {
+                (
+                    window.elem.clone(),
+                    window.is_animating,
+                    window.notifications_registered,
+                )
+            })
+        else {
+            return;
+        };
+        if old_elem == elem {
+            self.windows.get_mut(&wid).unwrap().last_known_frame = info.frame;
+            return;
+        }
+
+        // Move observer ownership before replacing the handle. Removing from an
+        // invalid old element can legitimately fail; Observer retains its callback
+        // context in that case, so a late notification remains memory-safe and its
+        // encoded wid still resolves to this logical window.
+        self.remove_window_notifications(&old_elem);
+        let notifications_registered = self.register_window_notifications(&elem, wid);
+        if !notifications_registered && old_notifications_registered {
+            // Keep the last usable binding and restore its notifications when the
+            // replacement cannot yet be observed. A later AXWindows refresh retries.
+            self.remove_window_notifications(&elem);
+            let _ = self.register_window_notifications(&old_elem, wid);
+            return;
+        }
+        if was_animating {
+            self.stop_notifications_for_animation(&elem);
+        }
+
+        self.elem_to_wid.remove(&old_elem);
+        self.elem_to_wid.insert(elem.clone(), wid);
+        if let Some(window) = self.windows.get_mut(&wid) {
+            window.elem = elem;
+            window.last_known_frame = info.frame;
+            window.notifications_registered = notifications_registered;
+            window.window_server_id = info.sys_id.or(window.window_server_id);
+            window.title = info.title.clone();
+        }
+        debug!(?wid, "Rebound window to refreshed AX element");
+    }
+
+    fn remove_window_notifications(&self, elem: &AXUIElement) {
+        for &(_, notif) in WINDOW_NOTIFICATIONS {
+            if let Err(err) = self.observer.remove_notification(elem, notif) {
+                trace!(
+                    ?elem,
+                    notif,
+                    ?err,
+                    "Could not remove notification from superseded AX element"
+                );
+            }
+        }
+    }
+
+    fn visible_window_server_info_map(
+        &self,
+        window_elements: &mut [(AXUIElement, NativeWindowIdentity)],
+    ) -> HashMap<WindowServerId, WindowServerInfo> {
+        let wsids: Vec<WindowServerId> = window_elements
+            .iter_mut()
+            .filter_map(|(elem, identity)| {
+                identity.resolve(|| WindowServerId::try_from(&*elem).ok())
+            })
+            .collect();
+        collect_visible_window_server_info(
+            window_server::get_windows(&wsids),
+            window_server::window_ordered_in,
+            |wsid| {
+                trace!(
+                    pid = ?self.pid,
+                    ?wsid,
+                    "Ignoring AX window whose WindowServer peer is explicitly ordered out"
+                );
+            },
+        )
+    }
+
+    #[inline]
+    fn has_visible_cg_peer(wsid: Option<WindowServerId>, hint: Option<WindowServerInfo>) -> bool {
+        wsid.is_none() || hint.is_some()
+    }
+
+    fn should_ignore_window_info(&self, elem: &AXUIElement, info: &WindowInfo) -> bool {
+        let bundle_is_widget = info.bundle_id.as_deref().map_or(false, |id| {
+            let id_lower = id.to_ascii_lowercase();
+            id_lower.ends_with(".widget") || id_lower.contains(".widget.")
+        });
+
+        let path_is_extension = info.path.as_ref().and_then(|p| p.to_str()).map_or(false, |path| {
+            let lower = path.to_ascii_lowercase();
+            lower.contains(".appex/") || lower.ends_with(".appex")
+        });
+
+        if bundle_is_widget || path_is_extension {
+            trace!(bundle_id = ?info.bundle_id, path = ?info.path, "Ignoring widget/app-extension window");
+            return true;
+        }
+
+        if is_transient_menu_role(info.ax_role.as_deref()) || is_menu_backing_window(elem, info) {
+            trace!(
+                role = ?info.ax_role,
+                subrole = ?info.ax_subrole,
+                "Ignoring non-standard AX window"
+            );
+            return true;
+        }
+
+        false
+    }
+
+    fn normalize_window_info(&self, elem: &AXUIElement, info: &mut WindowInfo) {
+        // TODO: improve this heuristic using ideas from AeroSpace(maybe implement a similar testing architecture based on ax dumps)
+        if (self.bundle_id.as_deref() == Some("com.googlecode.iterm2")
+            || self.bundle_id.as_deref() == Some("com.apple.TextInputUI.xpc.CursorUIViewService"))
+            && elem.attribute("AXTitleUIElement").is_err()
+        {
+            info.is_standard = false;
+        }
+
+        if let Some(wsid) = info.sys_id {
+            info.is_root = window_server::window_parent(wsid).is_none();
+
+            if self.bundle_id.as_deref() == Some("com.google.Chrome")
+                && !info.is_standard
+                && !info.is_resizable
+            {
+                trace!(
+                    ?wsid,
+                    title = %info.title,
+                    role = ?info.ax_role,
+                    subrole = ?info.ax_subrole,
+                    "Ignoring Chrome non-standard non-resizable window by marking it non-root"
+                );
+                info.is_root = false;
+                return;
+            }
+
+            if !info.is_root && !info.is_standard {
+                // Non-standard subrole windows (e.g. Java/Swing) may report a
+                // parent because the toolkit creates a container window. If
+                // that parent is not on-screen (frame is zero-sized or not
+                // visible in the window list), treat this as a root window so
+                // it can be managed.
+                if let Some(parent_id) = window_server::window_parent(wsid) {
+                    if let Some(parent_info) = window_server::get_window(parent_id) {
+                        let on_screen = parent_info.frame.size.width > 1.0
+                            && parent_info.frame.size.height > 1.0;
+                        if !on_screen {
+                            info.is_root = true;
+                        }
+                    } else {
+                        info.is_root = true;
+                    }
+                }
+            }
+        } else {
+            info.is_root = true;
+        }
+    }
+
+    fn handle_ax_error(&mut self, wid: WindowId, err: &AXError) -> bool {
+        if matches!(*err, AXError::InvalidUIElement) {
+            if self.remove_window(wid).is_some() {
+                self.send_event(Event::WindowInvalidated(
+                    wid,
+                    crate::actor::reactor::WindowInvalidationSource::InvalidUiElement,
+                ));
+                self.on_main_window_changed(Some(wid), false);
+            }
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_ax_result<T>(
+        &mut self,
+        wid: WindowId,
+        result: Result<T, AxError>,
+    ) -> Result<Option<T>, AxError> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(AxError::Ax(code)) if code == AXError::CannotComplete => {
+                trace!(
+                    ?wid,
+                    "AX request returned CannotComplete; leaving window registered"
+                );
+                Ok(None)
+            }
+            Err(AxError::Ax(code)) => {
+                if self.handle_ax_error(wid, &code) {
+                    Ok(None)
+                } else {
+                    Err(AxError::Ax(code))
+                }
+            }
+            Err(AxError::NotFound) => Ok(None),
+        }
+    }
+
+    fn remove_stale_windows(&mut self) {
+        let mut to_remove = Vec::new();
+        for (&wid, window) in self.windows.iter() {
+            // `kAXWindowsAttribute` is space-filtered and cannot be used to decide
+            // whether a tracked window still exists globally. Only drop state when
+            // the element itself has become invalid.
+            if matches!(window.elem.role(), Err(AxError::Ax(AXError::InvalidUIElement))) {
+                to_remove.push(wid);
+            }
+        }
+
+        for wid in to_remove {
+            self.remove_tracked_window(wid, "Removed stale window (invalid AX element)");
+        }
+    }
+
+    fn remove_tracked_window(&mut self, wid: WindowId, reason: &'static str) {
+        if self.remove_window(wid).is_some() {
+            debug!(?wid, reason);
+            self.send_event(Event::WindowInvalidated(
+                wid,
+                crate::actor::reactor::WindowInvalidationSource::StaleAxElement,
+            ));
+        }
+    }
+
+    fn send_event(&self, event: Event) { self.events_tx.send(event); }
+
+    fn window(&self, wid: WindowId) -> Result<&AppWindowState, AxError> {
+        assert_eq!(wid.pid, self.pid);
+        self.windows.get(&wid).ok_or(AxError::NotFound)
+    }
+
+    fn window_mut(&mut self, wid: WindowId) -> Result<&mut AppWindowState, AxError> {
+        assert_eq!(wid.pid, self.pid);
+        self.windows.get_mut(&wid).ok_or(AxError::NotFound)
+    }
+
+    fn id(&self, elem: &AXUIElement) -> Result<WindowId, AxError> {
+        self.id_with_identity(elem, &mut NativeWindowIdentity::default())
+    }
+
+    fn id_with_identity(
+        &self,
+        elem: &AXUIElement,
+        identity: &mut NativeWindowIdentity,
+    ) -> Result<WindowId, AxError> {
+        if let Some(id) = identity.resolve(|| WindowServerId::try_from(elem).ok()) {
+            if let Some(idx) = id.as_nonzero() {
+                let wid = WindowId { pid: self.pid, idx };
+                if self.windows.contains_key(&wid) {
+                    return Ok(wid);
+                }
+            }
+        }
+        if let Some(&wid) = self.elem_to_wid.get(elem) {
+            return Ok(wid);
+        }
+        Err(AxError::NotFound)
+    }
+
+    fn wid_for_notification(
+        &self,
+        elem: &AXUIElement,
+        hinted_wid: Option<WindowId>,
+    ) -> Result<WindowId, AxError> {
+        hinted_wid
+            .filter(|wid| wid.pid == self.pid)
+            .or_else(|| self.id(elem).ok())
+            .ok_or(AxError::NotFound)
+    }
+
+    fn is_current_window_element(&self, wid: WindowId, elem: &AXUIElement) -> bool {
+        self.windows.get(&wid).is_some_and(|window| window.elem == *elem)
+    }
+
+    fn stop_notifications_for_animation(&self, elem: &AXUIElement) {
+        for &kind in WINDOW_ANIMATION_NOTIFICATIONS {
+            let res = self.observer.remove_notification(elem, kind.name());
+            if let Err(err) = res {
+                debug!(
+                    notif = kind.name(),
+                    ?elem,
+                    "Removing notification failed with error {err}"
+                );
+            }
+        }
+    }
+
+    fn restart_notifications_after_animation(&self, elem: &AXUIElement) {
+        let hinted_wid = self.id(elem).ok();
+        for &kind in WINDOW_ANIMATION_NOTIFICATIONS {
+            let res = match hinted_wid {
+                Some(wid) => self.observer.add_notification_with_data(
+                    elem,
+                    kind.name(),
+                    encode_notification_data(kind, Some(wid)),
+                ),
+                None => self.observer.add_notification_with_data(
+                    elem,
+                    kind.name(),
+                    encode_notification_data(kind, None),
+                ),
+            };
+            if let Err(err) = res {
+                debug!(
+                    notif = kind.name(),
+                    ?elem,
+                    "Adding notification failed with error {err}"
+                );
+            }
+        }
+    }
+
+    fn remove_window(&mut self, wid: WindowId) -> Option<AppWindowState> {
+        let window = self.windows.remove(&wid)?;
+        self.elem_to_wid.remove(&window.elem);
+        if window.is_animating {
+            let app = self.app.clone();
+            self.enhanced_ui.release(&app);
+        }
+        Some(window)
+    }
+}
+
+/// An ID-targeted WindowServer query can return a retained record even after the user closes an
+/// Electron window and WindowServer orders it out. Treat only an explicit negative ordering result
+/// as authoritative: a failed private query remains inconclusive during display/lifecycle churn.
+fn window_server_peer_is_visible(ordered_in: Option<bool>) -> bool {
+    !matches!(ordered_in, Some(false))
+}
+
+fn collect_visible_window_server_info(
+    infos: Vec<WindowServerInfo>,
+    mut ordered_in: impl FnMut(WindowServerId) -> Option<bool>,
+    mut on_ordered_out: impl FnMut(WindowServerId),
+) -> HashMap<WindowServerId, WindowServerInfo> {
+    let mut info_by_id = HashMap::with_capacity_and_hasher(infos.len(), Default::default());
+    for info in infos {
+        if window_server_peer_is_visible(ordered_in(info.id)) {
+            info_by_id.insert(info.id, info);
+        } else {
+            on_ordered_out(info.id);
+        }
+    }
+    info_by_id
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if let Some((_, _, _, tx)) = self.last_activated.take() {
+            let _ = tx.send(());
+        }
+        self.enhanced_ui.restore_if_needed(&self.app);
+    }
+}
+
+pub(crate) async fn run_app(
+    pid: pid_t,
+    info: AppInfo,
+    events_tx: reactor::Sender,
+    tx_store: Option<WindowTxStore>,
+    handle: AppThreadHandle,
+    requests_rx: actor::Receiver<Request>,
+) {
+    let app = AXUIElement::application(pid);
+    let Some(running_app) = NSRunningApplication::with_process_id(pid) else {
+        info!(?pid, "Making NSRunningApplication failed; exiting app thread");
+        return;
+    };
+
+    let bundle_id = running_app.bundleIdentifier();
+
+    let Ok(process_info) = ProcessInfo::for_pid(pid) else {
+        info!(?pid, ?bundle_id, "Could not get ProcessInfo; exiting app thread");
+        return;
+    };
+    if process_info.is_xpc {
+        // XPC processes are not supposed to have windows so at best they are
+        // extra work and noise. Worse, Apple's QuickLookUIService reports
+        // having standard windows (these seem to be for Finder previews), but
+        // they are non-standard and unmanageable.
+        debug!(?pid, ?bundle_id, "Filtering out XPC process");
+        return;
+    }
+
+    let Ok(observer) = Observer::new(pid) else {
+        info!(?pid, ?bundle_id, "Making observer failed; exiting app thread");
+        return;
+    };
+    let (notifications_tx, notifications_rx) = actor::channel();
+    let observer = observer.install(move |elem, data| {
+        if let Some((notif, wid)) = decode_notification_data(pid, data) {
+            _ = notifications_tx.send((elem, notif, wid));
+        }
+    });
+
+    let (raises_tx, raises_rx) = actor::channel();
+    let mut info = info;
+    if info.bundle_id.is_none() {
+        info.bundle_id = bundle_id.as_deref().map(ToString::to_string);
+    }
+    if info.localized_name.is_none() {
+        info.localized_name = running_app.localizedName().as_deref().map(ToString::to_string);
+    }
+
+    let state = State {
+        pid,
+        running_app,
+        bundle_id: info.bundle_id.clone(),
+        app: app.clone(),
+        observer,
+        events_tx,
+        windows: HashMap::default(),
+        elem_to_wid: HashMap::default(),
+        main_window: None,
+        last_activated: None,
+        pending_activation_quiet: None,
+        is_hidden: false,
+        is_frontmost: false,
+        enhanced_ui: EnhancedUi::default(),
+        raises_tx,
+        tx_store,
+    };
+
+    state.run(info, handle, requests_rx, notifications_rx, raises_rx).await;
+}
+
+fn trace<T>(
+    desc: &str,
+    elem: &AXUIElement,
+    f: impl FnOnce() -> Result<T, AxError>,
+) -> Result<T, AxError> {
+    let start = Instant::now();
+    let out = f();
+    let end = Instant::now();
+    // FIXME: ?elem here can change system behavior because it sends requests
+    // to the app.
+    trace!(time = ?(end - start), /*?elem,*/ "{desc:12}");
+    if let Err(err) = &out {
+        let app = elem.parent().ok().flatten();
+        match err {
+            AxError::Ax(ax_err)
+                if matches!(
+                    *ax_err,
+                    AXError::CannotComplete | AXError::InvalidUIElement | AXError::Failure
+                ) =>
+            {
+                debug!("{desc} failed with {err} - app may have quit or become unresponsive");
+            }
+            _ => {
+                debug!("{desc} failed with {err} for element {elem:#?} with parent {app:#?}");
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_menu_role;
+
+    #[test]
+    fn transient_menu_roles_are_not_window_candidates() {
+        assert!(is_transient_menu_role(Some("AXPopover")));
+        assert!(is_transient_menu_role(Some("AXMenu")));
+        assert!(is_transient_menu_role(Some("AXMenuItem")));
+        assert!(!is_transient_menu_role(Some("AXWindow")));
+        assert!(!is_transient_menu_role(Some("AXTextField")));
+    }
+}
