@@ -11,6 +11,9 @@ focus-follows-mouse = false
 
 # Slide windows on workspace switches and layout changes; false makes them jump.
 animations = true
+# Optional overrides of `animations` for one kind of movement:
+# animate-workspace-switch = false
+# animate-layout = true
 animation-duration = 0.3 # seconds
 
 [gaps]

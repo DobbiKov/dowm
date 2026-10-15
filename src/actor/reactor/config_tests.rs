@@ -871,3 +871,15 @@ fn the_animations_key_switches_animation_off_and_back_on_live() {
     assert!(settings.animate);
     assert_eq!(settings.duration, 0.5);
 }
+
+#[test]
+fn workspace_switch_and_layout_animation_are_applied_independently() {
+    use super::animation::PresenterHost;
+    let mut h = one_display(&cfg(""));
+    h.send(Event::ConfigReloaded(parse(&cfg("animate-workspace-switch = false"))));
+    assert!(!h.reactor.visibility_config().animate_switches, "switches jump");
+    assert!(PresenterHost::animation_settings(&h.reactor).animate, "layout still slides");
+    h.send(Event::ConfigReloaded(parse(&cfg("animate-layout = false"))));
+    assert!(h.reactor.visibility_config().animate_switches, "switches slide");
+    assert!(!PresenterHost::animation_settings(&h.reactor).animate, "layout jumps");
+}

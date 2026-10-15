@@ -31,7 +31,9 @@ setting is on. To merge a stray Space by hand, delete the extra desktop in Missi
 
 Workspace switches and layout changes slide by default. Set `animations = false` in the
 config to make windows jump instead; `animation-duration = 0.3` (seconds) sets how long a
-slide lasts. Both apply on hot reload.
+slide lasts. To split them, `animate-workspace-switch` and `animate-layout` override
+`animations` for workspace switches and tiling layout moves respectively (for example
+`animate-workspace-switch = false` keeps layout moves animated). All apply on hot reload.
 
 ## Control socket and CLI
 

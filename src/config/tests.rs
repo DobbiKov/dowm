@@ -160,6 +160,28 @@ fn animations_can_be_turned_off_and_timed() {
 }
 
 #[test]
+fn switch_and_layout_animations_follow_the_master_switch_unless_overridden() {
+    let c = ok(MIN);
+    assert!(c.animate_workspace_switch && c.animate_layout);
+    let c = ok(&with("animations = false"));
+    assert!(!c.animate_workspace_switch && !c.animate_layout, "master off turns both off");
+    let c = ok(&with("animate-workspace-switch = false"));
+    assert!(!c.animate_workspace_switch && c.animate_layout, "only the switch is off");
+    let c = ok(&with("animate-layout = false"));
+    assert!(c.animate_workspace_switch && !c.animate_layout);
+    let c = ok(&with("animations = false\nanimate-layout = true"));
+    assert!(!c.animate_workspace_switch && c.animate_layout, "an override beats the master, in either order");
+    let c = ok(&with("animate-layout = true\nanimations = false"));
+    assert!(c.animate_layout);
+}
+
+#[test]
+fn bad_animation_override_types_name_their_keys() {
+    assert_eq!(paths(&err(&with("animate-layout = 'no'"))), vec!["animate-layout"]);
+    assert_eq!(paths(&err(&with("animate-workspace-switch = 1"))), vec!["animate-workspace-switch"]);
+}
+
+#[test]
 fn bad_animation_values_name_their_keys() {
     for (text, path) in [
         ("animations = 'no'", "animations"),

@@ -118,6 +118,10 @@ pub struct Config {
     pub focus_follows_mouse: bool,
     /// dowm-only: slide windows on workspace switches and layout changes. Off: they jump.
     pub animations: bool,
+    /// Whether workspace switches slide: `animate-workspace-switch`, else `animations`.
+    pub animate_workspace_switch: bool,
+    /// Whether tiling layout changes slide: `animate-layout`, else `animations`.
+    pub animate_layout: bool,
     /// dowm-only: seconds one animation lasts.
     pub animation_duration: f64,
     pub gaps: Gaps,
@@ -261,6 +265,8 @@ pub fn parse(text: &str) -> Result<Config, ConfigErrors> {
         on_focus_changed: Vec::new(),
         focus_follows_mouse: false,
         animations: true,
+        animate_workspace_switch: true,
+        animate_layout: true,
         animation_duration: DEFAULT_ANIMATION_DURATION,
         gaps: Gaps::default(),
         modes: BTreeMap::new(),
@@ -272,6 +278,8 @@ pub fn parse(text: &str) -> Result<Config, ConfigErrors> {
     };
     let mut persistent = BTreeSet::new();
     let mut modes_seen = false;
+    // Overrides of `animations`, resolved after the loop so key order does not matter.
+    let (mut switch_override, mut layout_override) = (None, None);
 
     for (key, value) in &table {
         match key.as_str() {
@@ -315,6 +323,8 @@ pub fn parse(text: &str) -> Result<Config, ConfigErrors> {
             "on-focus-changed" => config.on_focus_changed = ctx.actions(value, key),
             "focus-follows-mouse" => config.focus_follows_mouse = ctx.bool(value, key).unwrap_or(false),
             "animations" => config.animations = ctx.bool(value, key).unwrap_or(true),
+            "animate-workspace-switch" => switch_override = ctx.bool(value, key),
+            "animate-layout" => layout_override = ctx.bool(value, key),
             "animation-duration" => {
                 let seconds = value.as_float().or_else(|| value.as_integer().map(|i| i as f64));
                 match seconds {
@@ -365,6 +375,8 @@ pub fn parse(text: &str) -> Result<Config, ConfigErrors> {
     ctx.workspace_refs.extend(persistent);
     config.workspaces = derive_pool(&ctx.workspace_refs);
     config.warnings = warnings;
+    config.animate_workspace_switch = switch_override.unwrap_or(config.animations);
+    config.animate_layout = layout_override.unwrap_or(config.animations);
     ctx.errors.finish()?;
     Ok(config)
 }
