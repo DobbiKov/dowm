@@ -5,6 +5,12 @@
 //! and CGS connection notifications (via `window_notify`). [`Reactor::handle_event`]
 //! is synchronous and touches no OS API, so tests drive it directly with synthetic
 //! events (see `tests`).
+//!
+//! The reactor also owns each workspace's tiling tree ([`TreeStore`]), kept in step with
+//! workspace membership after every event and command, and runs the M3 tiling
+//! commands over it. Computed frames are exposed by [`Reactor::workspace_frames`] and
+//! [`Reactor::layout_targets`], and [`Reactor::flush_layout`] (run after every event)
+//! sends the changed ones to the presenter as animated frame writes; see `layout_apply`.
 
 use objc2_core_foundation::CGRect;
 use tracing::{debug, info, trace, warn};
@@ -32,16 +38,31 @@ use crate::sys::screen::DisplayId;
 use animation::{AnimationManager, AnimationSender, AnimationSettings, HostWindow, Message, PresenterHost};
 use objc2_core_foundation::CGRect as Rect;
 use transaction_manager::TransactionManager;
+use crate::layout::ops::{self, LayoutArg, ResizeDimension, SplitArg, TilingError};
+use crate::layout::{self, LayoutRegistry, LayoutSystem};
+use crate::config::{Action, Config};
+use crate::model::tree::NormalizeOptions;
+use effects::{Effect, EffectSender};
+use crate::model::tree_store::TreeStore;
 use crate::model::workspace::{
-    MonitorTarget, WorkspaceConfig, WorkspaceError, WorkspaceStore,
+    Direction, MonitorTarget, WorkspaceConfig, WorkspaceError, WorkspaceId, WorkspaceStore,
 };
 use crate::sys::window_server::{WindowServerId, WindowServerInfo};
 
 pub mod animation;
+mod config_apply;
+mod layout_apply;
+#[cfg(test)]
+mod layout_apply_tests;
+#[cfg(test)]
+mod config_tests;
+pub mod effects;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tiling_tests;
 #[cfg(test)]
 mod visibility_tests;
 #[cfg(test)]
@@ -66,19 +87,98 @@ pub enum WindowInvalidationSource {
     StaleAxElement,
 }
 
-/// A workspace or monitor command, as the hotkey and IPC layers will issue it.
+/// A workspace, monitor or tiling command, as the hotkey and IPC layers will issue it.
+/// The tiling commands act on the focused workspace's tree.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
-    /// `workspace N`.
-    Workspace(u32),
-    /// `move-node-to-workspace N`. `window: None` means the focused window.
-    MoveNodeToWorkspace { workspace: u32, window: Option<WindowId>, follow: bool },
+    /// `workspace <name>`.
+    Workspace(String),
+    /// `move-node-to-workspace <name>`. `window: None` means the focused window.
+    MoveNodeToWorkspace { workspace: String, window: Option<WindowId>, follow: bool },
     /// `workspace-back-and-forth`.
     WorkspaceBackAndForth,
     /// `move-workspace-to-monitor`.
     MoveWorkspaceToMonitor(MonitorTarget),
     /// `focus-monitor`.
     FocusMonitor(MonitorTarget),
+    /// `focus <direction>`; with `wrap`, past the edge to the other end of the workspace.
+    Focus { direction: Direction, wrap: bool },
+    /// `move <direction>`.
+    Move(Direction),
+    /// `join-with <direction>`.
+    JoinWith(Direction),
+    /// `split horizontal|vertical|opposite`.
+    Split(SplitArg),
+    /// `resize width|height|smart <amount>`; `amount` is in pixels, negative to shrink.
+    Resize { dimension: ResizeDimension, amount: i32 },
+    /// `resize width|height <size>`: make the window exactly `size` pixels along it.
+    ResizeTo { dimension: ResizeDimension, size: i32 },
+    /// `layout <arg>...`: one argument applies it; several cycle.
+    Layout(Vec<LayoutArg>),
+    /// `fullscreen`.
+    Fullscreen,
+    /// `balance-sizes`.
+    BalanceSizes,
+    /// `flatten-workspace-tree`.
+    FlattenWorkspaceTree,
+    /// `close-all-windows-but-current`: ask every other window of the focused workspace
+    /// to close (as Command-W would).
+    CloseAllWindowsButCurrent,
+    /// `move-mouse ...`: becomes an [`Effect::MoveMouse`] aimed at the window or monitor.
+    MoveMouse { target: MouseTarget, lazy: bool },
+}
+
+/// What `move-mouse` centers the cursor on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseTarget {
+    /// The focused window.
+    Window,
+    /// The focused monitor.
+    Monitor,
+}
+
+/// Why a [`Command`] failed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommandError {
+    Workspace(WorkspaceError),
+    Tiling(TilingError),
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Workspace(e) => e.fmt(f),
+            Self::Tiling(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for CommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Workspace(e) => Some(e),
+            Self::Tiling(e) => Some(e),
+        }
+    }
+}
+
+/// Where the tiling layout wants a window, with what the presenter needs to apply it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayoutTarget {
+    pub window: WindowId,
+    pub frame: CGRect,
+    /// Another window may be drawn over (or under) this one, so z-order matters.
+    pub overlapping: bool,
+    /// Bring this window to the front: it is the focused one of an overlapping layout.
+    pub raise: bool,
+}
+
+impl From<WorkspaceError> for CommandError {
+    fn from(e: WorkspaceError) -> Self { Self::Workspace(e) }
+}
+
+impl From<TilingError> for CommandError {
+    fn from(e: TilingError) -> Self { Self::Tiling(e) }
 }
 
 #[derive(Debug)]
@@ -159,6 +259,15 @@ pub enum Event {
     WindowServerReordered(WindowServerId),
     /// A workspace or monitor command.
     Command(Command),
+    /// Actions from a hotkey, run in order; the first failure stops the rest.
+    Actions(Vec<Action>),
+    /// A new, valid config (hot reload). See [`Reactor::apply_config`].
+    ConfigReloaded(Arc<Config>),
+    /// The start-up phase is over: `if.during-aerospace-startup` stops matching and
+    /// `after-startup-command` runs.
+    StartupFinished,
+    /// Focus-follows-mouse: the pointer has settled over this window.
+    PointerSettledOn(WindowServerId),
     /// A periodic nudge so time-based bookkeeping (unhide confirmation TTL) runs even
     /// when nothing else happens.
     VisibilityTick,
@@ -206,6 +315,9 @@ pub struct Reactor {
     windows: WindowStore,
     displays: DisplayStore,
     workspaces: WorkspaceStore,
+    /// Per-workspace tiling trees; see [`TreeStore::sync`].
+    trees: TreeStore,
+    layouts: LayoutRegistry,
     /// The window last reported as an app's main window; the target of
     /// `move-node-to-workspace` when no window is named.
     focused_window: Option<WindowId>,
@@ -226,10 +338,27 @@ pub struct Reactor {
     /// Shared with the termination handler: every parked window and its restore target.
     parked_registry: Arc<SharedRegistry<ParkedHandle>>,
     presenter: Presenter,
+    /// What the tiling layout last asked of each window; see [`Reactor::flush_layout`].
+    applied_layout: HashMap<WindowId, layout_apply::AppliedTarget>,
     clock: ClockHandle,
     /// Windows leaving a display during a switch. They are no longer on its visible
     /// workspace but still slide, so the presenter treats them as visible on it.
     sliding_out: HashSet<WindowId>,
+    /// The applied config; `None` until the first [`Reactor::apply_config`].
+    config: Option<Arc<Config>>,
+    /// Effects queued for the platform shell, oldest first.
+    effects: Vec<Effect>,
+    effects_tx: Option<EffectSender>,
+    /// Windows first seen since the `on-window-detected` rules last ran.
+    detected: Vec<WindowId>,
+    startup_finished: bool,
+    startup_commands_ran: bool,
+    /// The window a rule's commands act on instead of the focused one.
+    command_target: Option<WindowId>,
+    /// What the focus callbacks last saw.
+    last_focus: config_apply::FocusSnapshot,
+    in_callback: bool,
+    next_raise_sequence: u64,
 }
 
 impl Reactor {
@@ -244,6 +373,28 @@ impl Reactor {
     pub fn displays(&self) -> &DisplayStore { &self.displays }
 
     pub fn workspaces(&self) -> &WorkspaceStore { &self.workspaces }
+
+    pub fn trees(&self) -> &TreeStore { &self.trees }
+
+    pub fn layouts(&self) -> &LayoutRegistry { &self.layouts }
+
+    /// The window commands act on: last reported as an app's main window, or set by a
+    /// `focus` command.
+    pub fn focused_window(&self) -> Option<WindowId> { self.focused_window }
+
+    /// Add a layout system (bsp, master-stack, ... later); see [`LayoutRegistry::register`].
+    pub fn register_layout(&mut self, system: Box<dyn LayoutSystem>) {
+        self.layouts.register(system);
+        self.trees.set_policies(self.layouts.policies());
+    }
+
+    /// Choose the tree clean-up passes for every workspace.
+    pub fn set_normalization(&mut self, options: NormalizeOptions) { self.trees.set_options(options); }
+
+    #[cfg(test)]
+    pub(crate) fn tree_mut_for_test(&mut self, workspace: WorkspaceId) -> &mut crate::model::tree::WorkspaceTree {
+        self.trees.get_mut(workspace).expect("workspace has a tree")
+    }
 
     pub fn visibility(&self) -> &VisibilityTracker { &self.visibility }
 
@@ -387,32 +538,208 @@ impl Reactor {
         })
     }
 
-    /// Run a workspace or monitor command. [`Event::Command`] does this and logs
-    /// the error; tests call it directly to see it.
-    pub fn run_command(&mut self, command: Command) -> Result<(), WorkspaceError> {
+    /// Run a command. [`Event::Command`] does this and logs the error; tests call it
+    /// directly to see it.
+    pub fn run_command(&mut self, command: Command) -> Result<(), CommandError> {
         self.forget_destroyed_focus();
+        self.sync_trees();
         let result = match command {
-            Command::Workspace(n) => self.workspaces.switch_to_workspace(n, &self.displays),
+            Command::Workspace(name) => match self.workspaces.id_by_name(&name) {
+                Ok(id) => self
+                    .workspaces
+                    .switch_to_workspace(id.number(), &self.displays)
+                    .map_err(Into::into),
+                Err(e) => Err(e.into()),
+            },
             Command::MoveNodeToWorkspace { workspace, window, follow } => {
-                match window.or(self.focused_window) {
-                    Some(window) => self.workspaces.move_window_to_workspace(
-                        window,
-                        workspace,
-                        follow,
-                        &self.displays,
-                    ),
-                    None => self.workspaces.id_for(workspace).and(Err(WorkspaceError::NoFocusedWindow)),
+                match self.workspaces.id_by_name(&workspace) {
+                    Ok(id) => match window.or(self.focused_window) {
+                        Some(window) => self.workspaces.move_window_to_workspace(
+                            window,
+                            id.number(),
+                            follow,
+                            &self.displays,
+                        ),
+                        None => Err(WorkspaceError::NoFocusedWindow),
+                    },
+                    Err(e) => Err(e),
                 }
+                .map_err(Into::into)
             }
-            Command::WorkspaceBackAndForth => self.workspaces.back_and_forth(&self.displays),
-            Command::MoveWorkspaceToMonitor(target) => {
-                self.workspaces.move_workspace_to_monitor(&target, &self.displays)
+            Command::WorkspaceBackAndForth => {
+                self.workspaces.back_and_forth(&self.displays).map_err(Into::into)
             }
-            Command::FocusMonitor(target) => self.workspaces.focus_monitor(&target, &self.displays),
+            Command::MoveWorkspaceToMonitor(target) => self
+                .workspaces
+                .move_workspace_to_monitor(&target, &self.displays)
+                .map_err(Into::into),
+            Command::FocusMonitor(target) => {
+                self.workspaces.focus_monitor(&target, &self.displays).map_err(Into::into)
+            }
+            Command::Focus { direction, wrap } => self.cmd_focus(direction, wrap).map_err(Into::into),
+            Command::Move(direction) => self.cmd_move(direction).map_err(Into::into),
+            Command::JoinWith(direction) => self.cmd_join_with(direction).map_err(Into::into),
+            Command::Split(arg) => self.cmd_split(arg).map_err(Into::into),
+            Command::Resize { dimension, amount } => {
+                self.cmd_resize(dimension, amount).map_err(Into::into)
+            }
+            Command::Layout(args) => self.cmd_layout(&args).map_err(Into::into),
+            Command::Fullscreen => self.cmd_fullscreen().map_err(Into::into),
+            Command::BalanceSizes => self.cmd_balance_sizes().map_err(Into::into),
+            Command::FlattenWorkspaceTree => self.cmd_flatten_workspace_tree().map_err(Into::into),
+            Command::ResizeTo { dimension, size } => self.cmd_resize_to(dimension, size),
+            Command::CloseAllWindowsButCurrent => self.cmd_close_all_but_current(),
+            Command::MoveMouse { target, lazy } => self.cmd_move_mouse(target, lazy),
         };
+        // Membership may have changed (move-node-to-workspace): the leaf follows.
+        self.sync_trees();
+        self.check_focus_callbacks();
         self.sync_visibility();
         self.debug_check_invariants();
         result
+    }
+
+    /// Bring every workspace tree in line with workspace membership.
+    fn sync_trees(&mut self) {
+        self.orient_auto_roots();
+        self.trees.sync(&self.workspaces, &self.windows);
+        self.orient_auto_roots();
+    }
+
+    /// The window a tiling command acts on in `workspace`: the focused window if it is
+    /// in that workspace's tree, else the tree's own focus. With `tiled_only`, a floating
+    /// focused window is passed over for the tree's focus (spatial `focus` starts from
+    /// the tiling, however the user got to the floating window).
+    fn tiling_target(&self, workspace: WorkspaceId, tiled_only: bool) -> Result<WindowId, TilingError> {
+        let tree = self.trees.get(workspace).ok_or(TilingError::NoWorkspaceHere)?;
+        let usable = |w: &WindowId| tree.is_tiled(*w) || (!tiled_only && tree.is_floating(*w));
+        self.command_target
+            .filter(usable)
+            .or_else(|| self.focused_window.filter(usable))
+            .or_else(|| tree.focused_window())
+            .ok_or(TilingError::NoFocusedWindow)
+    }
+
+    /// The focused workspace, which tiling commands act on.
+    fn tiling_workspace(&self) -> Result<WorkspaceId, TilingError> {
+        if let Some(workspace) = self.command_target.and_then(|w| self.workspaces.workspace_of(w)) {
+            return Ok(workspace);
+        }
+        self.workspaces.focused_workspace().ok_or(TilingError::NoWorkspaceHere)
+    }
+
+    fn tree_mut(&mut self, workspace: WorkspaceId) -> Result<&mut crate::model::tree::WorkspaceTree, TilingError> {
+        self.trees.get_mut(workspace).ok_or(TilingError::NoWorkspaceHere)
+    }
+
+    // Each tiling command checks everything that can fail before it changes the tree, so
+    // a failed command leaves the tree as it was.
+
+    fn cmd_focus(&mut self, direction: Direction, wrap: bool) -> Result<(), TilingError> {
+        let workspace = self.tiling_workspace()?;
+        let window = self.tiling_target(workspace, true)?;
+        let tree = self.trees.get(workspace).ok_or(TilingError::NoWorkspaceHere)?;
+        let Some(target) = ops::focus_target(tree, window, direction, wrap, &self.layouts)? else {
+            return Ok(());
+        };
+        self.focused_window = Some(target);
+        let tree = self.tree_mut(workspace)?;
+        tree.set_focus(target);
+        // Focus going elsewhere ends fullscreen: the target would be hidden under it.
+        if tree.fullscreen() == Some(window) && target != window {
+            tree.toggle_fullscreen(window);
+        }
+        self.request_raise(target);
+        Ok(())
+    }
+
+    fn cmd_move(&mut self, direction: Direction) -> Result<(), TilingError> {
+        let workspace = self.tiling_workspace()?;
+        let window = self.tiling_target(workspace, false)?;
+        let tree = self.trees.get_mut(workspace).ok_or(TilingError::NoWorkspaceHere)?;
+        ops::move_window(tree, window, direction, &self.layouts)
+    }
+
+    fn cmd_join_with(&mut self, direction: Direction) -> Result<(), TilingError> {
+        let workspace = self.tiling_workspace()?;
+        let window = self.tiling_target(workspace, false)?;
+        let tree = self.trees.get_mut(workspace).ok_or(TilingError::NoWorkspaceHere)?;
+        ops::join_with(tree, window, direction, &self.layouts)
+    }
+
+    fn cmd_split(&mut self, arg: SplitArg) -> Result<(), TilingError> {
+        let workspace = self.tiling_workspace()?;
+        let window = self.tiling_target(workspace, false)?;
+        ops::split(self.tree_mut(workspace)?, window, arg)
+    }
+
+    fn cmd_resize(&mut self, dimension: ResizeDimension, amount: i32) -> Result<(), TilingError> {
+        let workspace = self.tiling_workspace()?;
+        let window = self.tiling_target(workspace, false)?;
+        let computed = self.workspace_layout(workspace).ok_or(TilingError::NoDisplay)?;
+        let tree = self.trees.get_mut(workspace).ok_or(TilingError::NoWorkspaceHere)?;
+        ops::resize(tree, window, dimension, amount, &computed, &self.layouts)
+    }
+
+    fn cmd_layout(&mut self, args: &[LayoutArg]) -> Result<(), TilingError> {
+        let workspace = self.tiling_workspace()?;
+        let window = self.tiling_target(workspace, false)?;
+        let tree = self.trees.get_mut(workspace).ok_or(TilingError::NoWorkspaceHere)?;
+        ops::apply_layout(tree, window, args, &self.layouts)
+    }
+
+    fn cmd_fullscreen(&mut self) -> Result<(), TilingError> {
+        let workspace = self.tiling_workspace()?;
+        let window = self.tiling_target(workspace, false)?;
+        self.tree_mut(workspace)?.toggle_fullscreen(window).ok_or(TilingError::NotInTree(window))?;
+        Ok(())
+    }
+
+    fn cmd_balance_sizes(&mut self) -> Result<(), TilingError> {
+        let workspace = self.tiling_workspace()?;
+        self.tree_mut(workspace)?.balance();
+        Ok(())
+    }
+
+    fn cmd_flatten_workspace_tree(&mut self) -> Result<(), TilingError> {
+        let workspace = self.tiling_workspace()?;
+        self.tree_mut(workspace)?.flatten_to_root();
+        Ok(())
+    }
+
+    // ---- computed layout ----
+
+    /// `workspace`'s layout in the frame of the display it is, or would be, shown on:
+    /// the one it is visible on, else the one it resolves to (a hidden workspace is laid
+    /// out for when it returns). Floating windows keep their own frames.
+    fn workspace_layout(&self, workspace: WorkspaceId) -> Option<layout::ComputedLayout> {
+        let display = self
+            .workspaces
+            .display_of(workspace)
+            .cloned()
+            .or_else(|| self.workspaces.resolve_display(workspace, &self.displays))?;
+        let area = to_layout_rect(self.displays.get(&display)?.frame);
+        let gaps = self
+            .config
+            .as_ref()
+            .map(|c| c.gaps.resolve(&display, &self.displays))
+            .unwrap_or_default();
+        let tree = self.trees.get(workspace)?;
+        let frames = |window: WindowId| self.windows.get(window).map(|r| to_layout_rect(r.frame));
+        Some(layout::gaps::compute_with_gaps(tree, area, &gaps, &self.layouts, &frames))
+    }
+
+    /// Where `workspace`'s windows belong, tiled and floating, by tiling layout. `None`
+    /// if the workspace is unknown or no display exists.
+    pub fn workspace_frames(&self, workspace: WorkspaceId) -> Option<Vec<(WindowId, CGRect)>> {
+        let computed = self.workspace_layout(workspace)?;
+        Some(computed.windows.into_iter().map(|(w, r)| (w, from_layout_rect(r))).collect())
+    }
+
+    /// The tiling layout's target for every window on a visible workspace, with the
+    /// z-order hints the presenter needs. [`Reactor::flush_layout`] applies them.
+    pub fn layout_targets(&self) -> Vec<LayoutTarget> {
+        self.layout_batches().into_iter().flat_map(|(_, targets)| targets).collect()
     }
 
     /// A destroyed window cannot stay the target of `move-node-to-workspace`.
@@ -433,6 +760,9 @@ impl Reactor {
         if let Err(violation) = self.check_visibility() {
             panic!("visibility invariant violated: {violation}");
         }
+        if let Err(violation) = self.trees.check_invariants(&self.workspaces, &self.windows) {
+            panic!("tiling tree invariant violated: {violation}");
+        }
     }
 
     fn debug_check_invariants(&self) {
@@ -446,6 +776,8 @@ impl Reactor {
             let _guard = span.enter();
             self.handle_event(event);
             self.flush_visibility();
+            self.flush_layout();
+            self.flush_effects();
         }
     }
 
@@ -483,6 +815,16 @@ impl Reactor {
                 debug!(pid, ?wid, "main window changed");
                 if let Some(wid) = wid {
                     self.focused_window = Some(wid);
+                    // The tree remembers focus per container; bring it up to date.
+                    self.workspaces.sync_windows(&self.windows);
+                    self.sync_trees();
+                    if let Some(tree) = self
+                        .workspaces
+                        .workspace_of(wid)
+                        .and_then(|ws| self.trees.get_mut(ws))
+                    {
+                        tree.set_focus(wid);
+                    }
                 }
             }
             Event::WindowsDiscovered { pid, token, successful, new, known_visible: _ } => {
@@ -554,6 +896,14 @@ impl Reactor {
                     warn!(?command, %error, "command failed");
                 }
             }
+            Event::Actions(actions) => {
+                if let Err(error) = self.run_actions(&actions, None) {
+                    warn!(?actions, %error, "actions stopped at the first failure");
+                }
+            }
+            Event::ConfigReloaded(config) => self.apply_config(config),
+            Event::StartupFinished => self.finish_startup(),
+            Event::PointerSettledOn(wsid) => self.focus_window_under_pointer(wsid),
             Event::VisibilityTick
             | Event::MenuOpened(_)
             | Event::MenuClosed(_)
@@ -561,7 +911,10 @@ impl Reactor {
             | Event::RaiseCompleted { .. } => {}
         }
         self.workspaces.sync_windows(&self.windows);
+        self.sync_trees();
         self.forget_destroyed_focus();
+        self.run_window_rules();
+        self.check_focus_callbacks();
         self.sync_visibility();
         self.debug_check_invariants();
         self.sync_window_notifications();
@@ -576,6 +929,7 @@ impl Reactor {
             return false;
         }
         if self.windows.upsert(wid, window) == Upsert::Inserted {
+            self.detected.push(wid);
             self.assign_display(wid);
             let record = &self.windows.get(wid).expect("just inserted");
             info!(
@@ -802,6 +1156,17 @@ impl PresenterHost for Reactor {
         let shown = self.workspaces.visible_workspace(&snapshot.uuid);
         shown.is_some() && shown == self.workspaces.workspace_of(wid)
     }
+}
+
+fn to_layout_rect(r: CGRect) -> layout::Rect {
+    layout::Rect::new(r.origin.x, r.origin.y, r.size.width, r.size.height)
+}
+
+fn from_layout_rect(r: layout::Rect) -> CGRect {
+    CGRect::new(
+        objc2_core_foundation::CGPoint::new(r.origin.x, r.origin.y),
+        objc2_core_foundation::CGSize::new(r.size.w, r.size.h),
+    )
 }
 
 fn display_label(display: Option<&DisplayUuid>) -> &str {

@@ -63,7 +63,7 @@ fn focus_window(h: &mut Harness, idx: u32) {
 }
 
 fn move_node(workspace: u32, window: Option<u32>, follow: bool) -> Command {
-    Command::MoveNodeToWorkspace { workspace, window: window.map(|i| wid(PID, i)), follow }
+    Command::MoveNodeToWorkspace { workspace: workspace.to_string(), window: window.map(|i| wid(PID, i)), follow }
 }
 
 fn to_monitor(direction: Direction) -> Command {
@@ -86,8 +86,8 @@ fn parked_setup() -> Harness {
         .with_force(5, vec![MonitorPattern::Name("^Right$".into())]);
     let mut h = two(config);
     assert_eq!((h.active("LEFT"), h.active("RIGHT")), (Some(1), Some(2)));
-    h.cmd(Command::Workspace(5)).unwrap();
-    h.cmd(Command::Workspace(2)).unwrap();
+    h.cmd(Command::Workspace("5".into())).unwrap();
+    h.cmd(Command::Workspace("2".into())).unwrap();
     h.cmd(focus_monitor(Direction::Left)).unwrap();
     let windows: [W; 2] = [w(1, 11, on_right()), w(2, 12, on_right())];
     h.launch(PID, &windows);
@@ -103,7 +103,7 @@ fn switching_to_a_workspace_pinned_to_another_display_focuses_that_display() {
     let mut h = two(split_config());
     assert_eq!((h.active("LEFT"), h.active("RIGHT")), (Some(1), Some(4)));
 
-    h.cmd(Command::Workspace(5)).unwrap();
+    h.cmd(Command::Workspace("5".into())).unwrap();
 
     assert_eq!(h.focused().as_deref(), Some("RIGHT"));
     assert_eq!(h.active("RIGHT"), Some(5));
@@ -116,7 +116,7 @@ fn switching_to_a_workspace_pinned_to_another_display_focuses_that_display() {
 fn switching_to_a_workspace_on_the_current_display_stays_local() {
     let mut h = two(split_config());
 
-    h.cmd(Command::Workspace(2)).unwrap();
+    h.cmd(Command::Workspace("2".into())).unwrap();
 
     assert_eq!(h.focused().as_deref(), Some("LEFT"));
     assert_eq!(h.active("LEFT"), Some(2));
@@ -131,14 +131,14 @@ fn switching_to_a_workspace_visible_elsewhere_only_moves_focus() {
     config.auto_back_and_forth = true;
     let mut h = two(config);
 
-    h.cmd(Command::Workspace(4)).unwrap();
+    h.cmd(Command::Workspace("4".into())).unwrap();
 
     assert_eq!(h.focused().as_deref(), Some("RIGHT"));
     assert_eq!((h.active("LEFT"), h.active("RIGHT")), (Some(1), Some(4)));
 
     // Auto back-and-forth: asking for the focused workspace again goes back to the
     // previous one, which is visible on LEFT, so that only moves focus too.
-    h.cmd(Command::Workspace(4)).unwrap();
+    h.cmd(Command::Workspace("4".into())).unwrap();
     assert_eq!(h.focused().as_deref(), Some("LEFT"));
     assert_eq!((h.active("LEFT"), h.active("RIGHT")), (Some(1), Some(4)));
 }
@@ -153,7 +153,7 @@ fn uneven_force_assignments_pin_the_remaining_numbers_to_the_second_display() {
     }
     let mut h = two(config);
 
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
 
     assert_eq!(h.focused().as_deref(), Some("RIGHT"));
     assert_eq!(h.active("RIGHT"), Some(3));
@@ -171,7 +171,7 @@ fn a_number_pinned_to_an_absent_display_falls_back_to_the_primary_display() {
     let mut h = two(config);
     h.cmd(focus_monitor(Direction::Right)).unwrap();
 
-    h.cmd(Command::Workspace(6)).unwrap();
+    h.cmd(Command::Workspace("6".into())).unwrap();
 
     assert_eq!(h.focused().as_deref(), Some("LEFT"));
     assert_eq!(h.active("LEFT"), Some(6));
@@ -203,7 +203,7 @@ fn moving_an_unknown_window_or_workspace_is_an_error_and_changes_nothing() {
     let mut h = two(WorkspaceConfig::numbered(4));
     h.launch(PID, &[w(1, 11, on_left())]);
 
-    assert_eq!(h.cmd(move_node(9, Some(1), false)), Err(WorkspaceError::NoSuchWorkspace(9)));
+    assert_eq!(h.cmd(move_node(9, Some(1), false)), Err(WorkspaceError::NoSuchWorkspace("9".into())));
     assert!(matches!(
         h.cmd(move_node(3, Some(7), false)),
         Err(WorkspaceError::UnknownWindow(_))
@@ -232,7 +232,7 @@ fn moved_workspace_keeps_its_number_and_windows_on_the_new_display() {
 
     // Number 1 now follows the workspace to the right display.
     h.cmd(focus_monitor(Direction::Left)).unwrap();
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     assert_eq!(h.focused().as_deref(), Some("RIGHT"));
     assert_eq!(h.active("RIGHT"), Some(1));
 }
@@ -268,8 +268,8 @@ fn the_pool_is_fixed_numbered_and_named_from_config() {
     assert_eq!(store.ids().map(WorkspaceId::number).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6]);
 
     // Neither commands nor lookups create workspaces.
-    assert_eq!(h.cmd(Command::Workspace(7)), Err(WorkspaceError::NoSuchWorkspace(7)));
-    assert_eq!(h.cmd(Command::Workspace(0)), Err(WorkspaceError::NoSuchWorkspace(0)));
+    assert_eq!(h.cmd(Command::Workspace("7".into())), Err(WorkspaceError::NoSuchWorkspace("7".into())));
+    assert_eq!(h.cmd(Command::Workspace("0".into())), Err(WorkspaceError::NoSuchWorkspace("0".into())));
     assert_eq!(h.reactor.workspaces().len(), 6);
 }
 
@@ -295,7 +295,7 @@ fn unplugged_display_workspaces_stay_hidden_with_their_windows() {
     assert_eq!((hidden.display.as_str(), hidden.was_active), ("RIGHT", false));
 
     // Both can be summoned onto the remaining display.
-    h.cmd(Command::Workspace(5)).unwrap();
+    h.cmd(Command::Workspace("5".into())).unwrap();
     assert_eq!(h.active("LEFT"), Some(5));
     assert_eq!(h.focused().as_deref(), Some("LEFT"));
 }
@@ -355,7 +355,7 @@ fn reconnected_display_gets_its_workspaces_back() {
     let mut h = parked_setup();
     h.screens_named(&[screen_left()]);
     // While parked, the user pulls one of them onto the main display.
-    h.cmd(Command::Workspace(5)).unwrap();
+    h.cmd(Command::Workspace("5".into())).unwrap();
     assert_eq!(h.active("LEFT"), Some(5));
 
     // The display returns with a new CG id (matched by UUID).
@@ -404,7 +404,7 @@ fn moving_a_parked_workspace_by_hand_keeps_it_where_it_was_put() {
     assert_eq!(h.reactor.workspaces().home_display(ws(3)).unwrap().display.as_str(), "FAR");
 
     // The user summons it to LEFT and sends it on to MID.
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     assert_eq!(h.active("LEFT"), Some(3));
     h.cmd(to_monitor(Direction::Right)).unwrap();
     assert!(h.reactor.workspaces().home_display(ws(3)).is_none());
@@ -445,9 +445,9 @@ fn the_whole_pool_exists_with_one_display_and_shares_out_when_another_connects()
     // All six exist with one display, even the second display's share.
     assert_eq!(h.reactor.workspaces().len(), 6);
     assert_eq!(h.active("LEFT"), Some(1));
-    h.cmd(Command::Workspace(6)).unwrap();
+    h.cmd(Command::Workspace("6".into())).unwrap();
     assert_eq!(h.active("LEFT"), Some(6));
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
 
     // A second display takes the first hidden workspace of its share.
     h.screens_named(&both());
@@ -465,7 +465,7 @@ fn the_whole_pool_exists_with_one_display_and_shares_out_when_another_connects()
 #[test]
 fn a_display_keeps_its_workspace_when_its_cg_id_and_frame_change() {
     let mut h = two(WorkspaceConfig::numbered(6));
-    h.cmd(Command::Workspace(4)).unwrap();
+    h.cmd(Command::Workspace("4".into())).unwrap();
     h.cmd(focus_monitor(Direction::Right)).unwrap();
 
     h.screens_named(&[
@@ -487,7 +487,7 @@ fn a_workspace_with_no_history_lands_on_the_primary_display() {
     let mut h = two(WorkspaceConfig::numbered(6));
     h.cmd(focus_monitor(Direction::Right)).unwrap();
 
-    h.cmd(Command::Workspace(5)).unwrap();
+    h.cmd(Command::Workspace("5".into())).unwrap();
 
     assert_eq!(h.focused().as_deref(), Some("LEFT"));
     assert_eq!(h.active("LEFT"), Some(5));
@@ -514,12 +514,12 @@ fn force_assignment_beats_the_currently_visible_display() {
 fn a_hidden_workspace_returns_to_its_last_seen_display() {
     let mut h = two(WorkspaceConfig::numbered(6));
     // 3 goes to LEFT, then is sent to RIGHT, so 2 is evicted from RIGHT and hidden.
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     h.cmd(to_monitor(Direction::Right)).unwrap();
     assert_eq!(h.active("RIGHT"), Some(3));
     h.cmd(focus_monitor(Direction::Left)).unwrap();
 
-    h.cmd(Command::Workspace(2)).unwrap();
+    h.cmd(Command::Workspace("2".into())).unwrap();
 
     assert_eq!(h.focused().as_deref(), Some("RIGHT"), "2 was last seen on RIGHT");
     assert_eq!(h.active("RIGHT"), Some(2));
@@ -537,7 +537,7 @@ fn force_assignment_patterns_are_tried_in_order_and_skip_absent_displays() {
     );
     let mut h = two(config);
 
-    h.cmd(Command::Workspace(4)).unwrap();
+    h.cmd(Command::Workspace("4".into())).unwrap();
 
     assert_eq!(h.active("RIGHT"), Some(4));
     assert_eq!(h.focused().as_deref(), Some("RIGHT"));
@@ -553,11 +553,11 @@ fn force_assignment_by_name_regex_main_and_sequence_order_left_to_right() {
     let mut h = Harness::with_workspaces(config);
     h.screens_named(&[screen_right(2), screen_left()]);
 
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     assert_eq!(h.active("RIGHT"), Some(3));
-    h.cmd(Command::Workspace(4)).unwrap();
+    h.cmd(Command::Workspace("4".into())).unwrap();
     assert_eq!(h.active("LEFT"), Some(4));
-    h.cmd(Command::Workspace(5)).unwrap();
+    h.cmd(Command::Workspace("5".into())).unwrap();
     assert_eq!(h.active("LEFT"), Some(5));
 }
 
@@ -570,12 +570,12 @@ fn secondary_only_matches_when_there_is_exactly_one_non_main_display() {
         screen_right(2),
         ("FAR", 3, rect(2000., 0., 1000., 1000.), None),
     ]);
-    h.cmd(Command::Workspace(4)).unwrap();
+    h.cmd(Command::Workspace("4".into())).unwrap();
     // Ambiguous: no match, so the chain falls through to the primary display.
     assert_eq!(h.active("LEFT"), Some(4));
 
     h.screens_named(&both());
-    h.cmd(Command::Workspace(4)).unwrap();
+    h.cmd(Command::Workspace("4".into())).unwrap();
     assert_eq!(h.active("RIGHT"), Some(4));
 }
 
@@ -590,7 +590,7 @@ fn invalid_force_assignment_config_is_rejected() {
     let bad_ws = WorkspaceConfig::numbered(3).with_force(9, vec![MonitorPattern::Main]);
     assert!(matches!(
         Reactor::with_workspaces(None, bad_ws),
-        Err(WorkspaceError::NoSuchWorkspace(9))
+        Err(WorkspaceError::NoSuchWorkspace(ref name)) if name == "9"
     ));
     let bad_seq = WorkspaceConfig::numbered(3).with_force(1, vec![MonitorPattern::Sequence(0)]);
     assert!(matches!(
@@ -649,7 +649,7 @@ fn losing_every_display_keeps_all_windows_and_restores_on_return() {
 
     h.screens_named(&[]);
     assert_eq!(h.focused(), None);
-    assert_eq!(h.cmd(Command::Workspace(1)), Err(WorkspaceError::NoDisplays));
+    assert_eq!(h.cmd(Command::Workspace("1".into())), Err(WorkspaceError::NoDisplays));
     assert_eq!(h.workspace_of(wid(PID, 1)), Some(2));
     assert_eq!(h.workspace_of(wid(PID, 2)), Some(5));
 
@@ -665,7 +665,7 @@ fn workspace_back_and_forth_returns_to_the_previous_workspace() {
     let mut h = two(WorkspaceConfig::numbered(6));
     assert_eq!(h.cmd(Command::WorkspaceBackAndForth), Err(WorkspaceError::NoPreviousWorkspace));
 
-    h.cmd(Command::Workspace(4)).unwrap();
+    h.cmd(Command::Workspace("4".into())).unwrap();
     assert_eq!(h.active("LEFT"), Some(4));
 
     h.cmd(Command::WorkspaceBackAndForth).unwrap();
@@ -677,8 +677,8 @@ fn workspace_back_and_forth_returns_to_the_previous_workspace() {
 #[test]
 fn workspace_without_auto_back_and_forth_is_idempotent() {
     let mut h = two(WorkspaceConfig::numbered(6));
-    h.cmd(Command::Workspace(4)).unwrap();
-    h.cmd(Command::Workspace(4)).unwrap();
+    h.cmd(Command::Workspace("4".into())).unwrap();
+    h.cmd(Command::Workspace("4".into())).unwrap();
     assert_eq!(h.active("LEFT"), Some(4));
 }
 
@@ -792,7 +792,7 @@ fn many_windows_and_repeated_reconfiguration_keep_the_invariants() {
         (1..=200).map(|i| w(i, 1000 + i, if i % 2 == 0 { on_left() } else { on_right() })).collect();
     h.launch(PID, &windows);
     for round in 0..20u32 {
-        h.cmd(Command::Workspace(round % 9 + 1)).unwrap();
+        h.cmd(Command::Workspace((round % 9 + 1).to_string())).unwrap();
         let _ = h.cmd(to_monitor(Direction::Right));
         h.screens_named(&[screen_left()]);
         h.screens_named(&both());
@@ -846,7 +846,7 @@ fn random_op(rng: &mut Lcg, pool: u32, present: &mut [bool; 3], h: &mut Harness,
         0..=2 => {
             let n = 1 + rng.below(u64::from(pool)) as u32;
             log.push(format!("workspace {n}"));
-            let _ = h.cmd(Command::Workspace(n));
+            let _ = h.cmd(Command::Workspace(n.to_string()));
         }
         3 => {
             log.push(format!("to_monitor {dir:?}"));
@@ -946,7 +946,7 @@ fn random_commands_and_display_changes_keep_every_invariant() {
 fn a_reconnect_puts_non_active_returning_workspaces_back_hidden() {
     let mut h = Harness::with_workspaces(WorkspaceConfig::numbered(6));
     h.screens_named(&all_three());
-    h.cmd(Command::Workspace(4)).unwrap(); // LEFT shows 4; 1 is hidden, last seen on LEFT
+    h.cmd(Command::Workspace("4".into())).unwrap(); // LEFT shows 4; 1 is hidden, last seen on LEFT
     h.screens_named(&[screen_mid(), screen_far()]); // LEFT leaves: 4 was active, 1 was not
     assert_eq!(h.reactor.workspaces().home_display(ws(4)).map(|home| home.was_active), Some(true));
     assert_eq!(h.reactor.workspaces().home_display(ws(1)).map(|home| home.was_active), Some(false));
@@ -964,7 +964,7 @@ fn a_reconnect_puts_non_active_returning_workspaces_back_hidden() {
 #[test]
 fn back_and_forth_after_the_focused_display_is_unplugged_goes_to_the_workspace_that_was_focused() {
     let mut h = two(WorkspaceConfig::numbered(4));
-    h.cmd(Command::Workspace(2)).unwrap(); // focus RIGHT (showing 2); previous is 1
+    h.cmd(Command::Workspace("2".into())).unwrap(); // focus RIGHT (showing 2); previous is 1
     assert_eq!(h.focused().as_deref(), Some("RIGHT"));
     assert_eq!(h.reactor.workspaces().previous_workspace(), Some(ws(1)));
 

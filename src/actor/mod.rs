@@ -16,6 +16,7 @@ use tracing::Span;
     clippy::unnecessary_map_or
 )]
 pub mod app;
+pub mod input;
 pub mod notification_center;
 pub mod reactor;
 pub mod window_notify;

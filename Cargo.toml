@@ -1,0 +1,86 @@
+[package]
+name = "dowm"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "dowm: macOS tiling WM built on an engine ported from rift"
+
+[lib]
+name = "dowm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dowm"
+path = "src/bin/dowm.rs"
+
+[[bin]]
+name = "dowm-spike"
+path = "src/bin/dowm-spike.rs"
+
+[[bin]]
+name = "dowm-spike-target"
+path = "src/bin/dowm-spike-target.rs"
+
+[features]
+default = []
+# rift's experimental custom Cocoa event loop for the executor (sys/cocoa.rs).
+custom-event-loop = ["objc2-foundation/NSDate", "objc2-foundation/NSRunLoop"]
+# rift's experimental opt-out of AXUIElementDestroyed handling (actor/app.rs).
+disable-axuielement-destroyed = []
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+crossbeam-channel = "0.5"
+signal-hook = "0.3"
+toml = "1.1.8"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+anyhow = { version = "1.0.83", default-features = false }
+bitflags = "2.4.1"
+cgs = "0.3.0"
+dashmap = "6.1.0"
+# Pinned to the revision rift's Cargo.lock resolves.
+dispatchr = { git = "https://github.com/drewcrawford/dispatchr", rev = "5b4054c472d1108ab6ac690db6ae6eb5b0f94e62" }
+nix = { version = "0.30.1", features = ["process", "user"] }
+num_enum = "0.7.4"
+once_cell = { version = "1.21.3", default-features = false }
+parking_lot = "0.12"
+regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"] }
+rustc-hash = "2.1.1"
+serde = { version = "1.0.201", default-features = false, features = ["derive", "std"] }
+serde_with = "3.9.0"
+static_assertions = "1.1.0"
+strum_macros = "0.27.2"
+tokio = { version = "1.35.1", features = ["libc", "macros", "sync"] }
+tokio-stream = "0.1.16"
+tokio-util = "0.7.15"
+tracing = "0.1.40"
+objc2 = { version = "0.6.2", default-features = false, features = ["exception"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication", "NSEvent", "NSGraphics", "NSResponder", "NSRunningApplication", "NSScreen",
+    "NSView", "NSWindow", "NSWorkspace", "libc", "objc2-core-foundation", "objc2-core-graphics",
+    "objc2-quartz-core",
+] }
+objc2-application-services = { version = "0.3.2", default-features = false, features = [
+    "AXError", "AXUIElement", "AXValue", "HIServices", "libc",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "CFArray", "CFCGTypes", "CFData", "CFDictionary", "CFMachPort", "CFNumber", "CFRunLoop",
+    "CFString",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "CGDirectDisplay", "CGError", "CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation",
+    "CGWindow", "libc", "objc2",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "block2", "NSArray", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry",
+    "NSKeyValueCoding", "NSNotification", "NSObject", "NSOperation", "NSProcessInfo", "NSRunLoop",
+    "NSString", "NSValue",
+] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
+    "CABase", "CADisplayLink", "CAFrameRateRange", "objc2-core-foundation",
+] }
+
+[profile.release]
+debug = 1

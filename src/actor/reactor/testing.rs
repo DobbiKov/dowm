@@ -6,13 +6,14 @@
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
-use super::{Command, Event, Reactor};
+use super::{Command, CommandError, Event, Reactor};
 use crate::actor;
 use crate::actor::app::{self, AppInfo, AppThreadHandle, WindowId, WindowInventoryToken, pid_t};
 use crate::actor::window_notify;
 use crate::common::collections::HashMap;
 use crate::model::display::{DisplaySnapshot, DisplayUuid};
 use crate::model::window_store::WindowRecord;
+use crate::layout::ops::TilingError;
 use crate::model::workspace::{WorkspaceConfig, WorkspaceError, WorkspaceId};
 use crate::model::window_store::tests::info;
 use crate::sys::screen::DisplayId;
@@ -60,6 +61,14 @@ impl Harness {
         h
     }
 
+    /// A harness whose reactor is built from the config `text` (workspace pool included).
+    pub fn with_config_text(text: &str) -> Self {
+        let config = crate::config::parse(text).unwrap_or_else(|e| panic!("test config is invalid:\n{e}"));
+        let mut h = Harness::new();
+        h.reactor = Reactor::with_config(None, std::sync::Arc::new(config)).expect("valid workspace pool");
+        h
+    }
+
     /// Deliver an event, then check the workspace invariants. Every scenario goes
     /// through here, so the invariants are checked after every single step.
     pub fn send(&mut self, event: Event) {
@@ -71,7 +80,20 @@ impl Harness {
     pub fn cmd(&mut self, command: Command) -> Result<(), WorkspaceError> {
         let result = self.reactor.run_command(command);
         self.reactor.assert_invariants();
-        result
+        result.map_err(|e| match e {
+            CommandError::Workspace(e) => e,
+            CommandError::Tiling(e) => panic!("`cmd` is for workspace commands, got {e}"),
+        })
+    }
+
+    /// Run a tiling command, then check the invariants whether it succeeded or not.
+    pub fn tile(&mut self, command: Command) -> Result<(), TilingError> {
+        let result = self.reactor.run_command(command);
+        self.reactor.assert_invariants();
+        result.map_err(|e| match e {
+            CommandError::Tiling(e) => e,
+            CommandError::Workspace(e) => panic!("`tile` is for tiling commands, got {e}"),
+        })
     }
 
     /// The workspace visible on the display `uuid`, as its number.
@@ -119,17 +141,26 @@ impl Harness {
 
     /// Launch an app actor for `pid` that already has `windows` open.
     pub fn launch(&mut self, pid: pid_t, windows: &[W]) {
+        self.launch_app(pid, &format!("com.example.app{pid}"), &format!("App {pid}"), windows);
+    }
+
+    /// Launch an app actor with the given bundle id and name.
+    pub fn launch_app(&mut self, pid: pid_t, bundle: &str, name: &str, windows: &[W]) {
         let (handle, rx) = AppThreadHandle::channel();
         self.apps.insert(pid, rx);
         let visible_windows = windows
             .iter()
-            .map(|w| (wid(pid, w.idx), info(&format!("w{}", w.idx), w.frame, w.sys_id)))
+            .map(|w| {
+                let mut window = info(&format!("w{}", w.idx), w.frame, w.sys_id);
+                window.bundle_id = Some(bundle.to_owned());
+                (wid(pid, w.idx), window)
+            })
             .collect();
         self.send(Event::ApplicationLaunched {
             pid,
             info: AppInfo {
-                bundle_id: Some(format!("com.example.app{pid}")),
-                localized_name: Some(format!("App {pid}")),
+                bundle_id: Some(bundle.to_owned()),
+                localized_name: Some(name.to_owned()),
             },
             handle,
             is_frontmost: false,
@@ -144,6 +175,16 @@ impl Harness {
         let window = info(&format!("w{}", w.idx), w.frame, w.sys_id);
         self.send(Event::WindowCreated(wid(pid, w.idx), window, None, None));
     }
+
+    /// The app actor reports a new window with this title and bundle id.
+    pub fn ax_created_as(&mut self, pid: pid_t, w: W, title: &str, bundle: &str) {
+        let mut window = info(title, w.frame, w.sys_id);
+        window.bundle_id = Some(bundle.to_owned());
+        self.send(Event::WindowCreated(wid(pid, w.idx), window, None, None));
+    }
+
+    /// The effects the reactor queued since the last call.
+    pub fn effects(&mut self) -> Vec<super::effects::Effect> { self.reactor.take_effects() }
 
     /// CGS reports a WindowServer window creation.
     pub fn cgs_created(&mut self, pid: pid_t, sys_id: u32, frame: CGRect) {

@@ -123,7 +123,8 @@ impl Default for WorkspaceConfig {
 pub enum WorkspaceError {
     /// The config has no workspaces.
     EmptyPool,
-    NoSuchWorkspace(u32),
+    /// A workspace named (or numbered) like this is not in the pool.
+    NoSuchWorkspace(String),
     /// A force-assignment or monitor pattern that cannot be used.
     BadPattern(String),
     NoDisplays,
@@ -156,7 +157,7 @@ impl std::error::Error for WorkspaceError {}
 
 /// A [`MonitorPattern`] with its regex compiled.
 #[derive(Clone, Debug)]
-enum Pattern {
+pub enum Pattern {
     Sequence(usize),
     Main,
     Secondary,
@@ -164,7 +165,7 @@ enum Pattern {
 }
 
 impl Pattern {
-    fn compile(pattern: &MonitorPattern) -> Result<Self, WorkspaceError> {
+    pub fn compile(pattern: &MonitorPattern) -> Result<Self, WorkspaceError> {
         Ok(match pattern {
             MonitorPattern::Sequence(0) => {
                 return Err(WorkspaceError::BadPattern("sequence numbers start at 1".into()));
@@ -176,6 +177,11 @@ impl Pattern {
                 Regex::new(re).map_err(|e| WorkspaceError::BadPattern(format!("{re:?}: {e}")))?,
             ),
         })
+    }
+
+    /// Whether this pattern selects the display `uuid` among `displays`.
+    pub fn matches(&self, uuid: &DisplayUuid, displays: &DisplayStore) -> bool {
+        self.find(displays).is_some_and(|found| &found == uuid)
     }
 
     fn find(&self, displays: &DisplayStore) -> Option<DisplayUuid> {
@@ -197,6 +203,12 @@ impl Pattern {
                 .map(|d| d.uuid.clone()),
         }
     }
+}
+
+/// Whether `pattern` selects the display `uuid` among `displays`. A pattern that does not
+/// compile matches nothing.
+pub fn pattern_matches(pattern: &MonitorPattern, uuid: &DisplayUuid, displays: &DisplayStore) -> bool {
+    Pattern::compile(pattern).is_ok_and(|p| p.matches(uuid, displays))
 }
 
 /// Where a workspace lived when its display was unplugged. Reconnecting that display
@@ -259,7 +271,7 @@ impl WorkspaceStore {
             let slot = (rule.workspace as usize)
                 .checked_sub(1)
                 .and_then(|i| workspaces.get_mut(i))
-                .ok_or(WorkspaceError::NoSuchWorkspace(rule.workspace))?;
+                .ok_or(WorkspaceError::NoSuchWorkspace(rule.workspace.to_string()))?;
             for pattern in &rule.monitors {
                 slot.force.push(Pattern::compile(pattern)?);
             }
@@ -376,7 +388,7 @@ impl WorkspaceStore {
             return Err(WorkspaceError::NoSuchDisplay);
         }
         if self.get(id).is_none() {
-            return Err(WorkspaceError::NoSuchWorkspace(id.0));
+            return Err(WorkspaceError::NoSuchWorkspace(id.0.to_string()));
         }
         if self.visible.get(display) == Some(&id) {
             return Ok(());
@@ -513,9 +525,49 @@ impl WorkspaceStore {
         if number >= 1 && number as usize <= self.workspaces.len() {
             Ok(WorkspaceId(number))
         } else {
-            Err(WorkspaceError::NoSuchWorkspace(number))
+            Err(WorkspaceError::NoSuchWorkspace(number.to_string()))
         }
     }
+
+    /// The workspace called `name`.
+    pub fn id_by_name(&self, name: &str) -> Result<WorkspaceId, WorkspaceError> {
+        self.workspaces
+            .iter()
+            .position(|w| w.name == name)
+            .map(|i| WorkspaceId(i as u32 + 1))
+            .ok_or_else(|| WorkspaceError::NoSuchWorkspace(name.to_owned()))
+    }
+
+    /// Replace the force-assignments (config reload). Workspaces already visible stay
+    /// where they are until the next command that resolves their display.
+    pub fn set_force_assignments(
+        &mut self,
+        assignments: &[ForceAssignment],
+    ) -> Result<(), WorkspaceError> {
+        let mut force: Vec<Vec<Pattern>> = vec![Vec::new(); self.workspaces.len()];
+        for rule in assignments {
+            let slot = (rule.workspace as usize)
+                .checked_sub(1)
+                .and_then(|i| force.get_mut(i))
+                .ok_or_else(|| WorkspaceError::NoSuchWorkspace(rule.workspace.to_string()))?;
+            for pattern in &rule.monitors {
+                slot.push(Pattern::compile(pattern)?);
+            }
+        }
+        for (workspace, patterns) in self.workspaces.iter_mut().zip(force) {
+            workspace.force = patterns;
+        }
+        Ok(())
+    }
+
+    /// Change what `workspace N` does on the focused workspace (config reload).
+    pub fn set_auto_back_and_forth(&mut self, on: bool) { self.auto_back_and_forth = on; }
+
+    /// The names of the pool, in order.
+    pub fn names(&self) -> Vec<String> { self.workspaces.iter().map(|w| w.name.clone()).collect() }
+
+    /// Focus `display` (the one a window was focused on, say).
+    pub fn focus_display(&mut self, display: DisplayUuid) { self.set_focused_display(display); }
 
     /// `workspace N`: show workspace `number` on the display it belongs to and focus
     /// that display.
@@ -880,7 +932,7 @@ mod tests {
         );
         assert_eq!(
             store.set_active_workspace(&id(1), WorkspaceId::new(3), &displays),
-            Err(WorkspaceError::NoSuchWorkspace(3))
+            Err(WorkspaceError::NoSuchWorkspace("3".into()))
         );
     }
 
@@ -973,5 +1025,40 @@ mod tests {
 
         assert_eq!(result, Err(WorkspaceError::NoDisplays));
         assert_eq!(store.workspace_of(window), Some(WorkspaceId::new(1)));
+    }
+    #[test]
+    fn workspaces_are_found_by_name_and_unknown_names_are_errors() {
+        let mut names = WorkspaceConfig::numbered(2);
+        names.names.push("T".into());
+        let store = WorkspaceStore::new(&names).unwrap();
+        assert_eq!(store.id_by_name("1"), Ok(WorkspaceId::new(1)));
+        assert_eq!(store.id_by_name("T"), Ok(WorkspaceId::new(3)));
+        assert_eq!(store.names(), ["1", "2", "T"]);
+        assert_eq!(store.id_by_name("t"), Err(WorkspaceError::NoSuchWorkspace("t".into())));
+        assert_eq!(store.id_by_name(""), Err(WorkspaceError::NoSuchWorkspace(String::new())));
+    }
+
+    #[test]
+    fn pattern_matches_selects_one_display_and_ignores_bad_regexes() {
+        let (_, displays, _) = setup(2);
+        assert!(pattern_matches(&MonitorPattern::Main, &id(1), &displays));
+        assert!(!pattern_matches(&MonitorPattern::Main, &id(2), &displays));
+        assert!(pattern_matches(&MonitorPattern::Secondary, &id(2), &displays));
+        assert!(pattern_matches(&MonitorPattern::Sequence(2), &id(2), &displays));
+        assert!(!pattern_matches(&MonitorPattern::Name("(".into()), &id(1), &displays));
+    }
+
+    #[test]
+    fn force_assignments_can_be_replaced_live() {
+        let (mut store, displays, _) = setup(4);
+        let three = WorkspaceId::new(3);
+        assert_eq!(store.forced_display(three, &displays), None);
+        let rule = ForceAssignment { workspace: 3, monitors: vec![MonitorPattern::Secondary] };
+        store.set_force_assignments(&[rule]).unwrap();
+        assert_eq!(store.forced_display(three, &displays), Some(id(2)));
+        store.set_force_assignments(&[]).unwrap();
+        assert_eq!(store.forced_display(three, &displays), None, "an empty list clears them");
+        let bad = ForceAssignment { workspace: 9, monitors: vec![] };
+        assert_eq!(store.set_force_assignments(&[bad]), Err(WorkspaceError::NoSuchWorkspace("9".into())));
     }
 }

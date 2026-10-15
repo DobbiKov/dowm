@@ -107,7 +107,7 @@ fn switching_workspace_hides_the_old_windows_past_the_left_corner() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
 
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
 
     let acts = actions(&mut h);
     assert_eq!(acts.len(), 1);
@@ -135,7 +135,7 @@ fn the_right_hand_display_parks_past_its_right_corner() {
     }))
     .unwrap();
 
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
 
     let acts = actions(&mut h);
     let [VisibilityAction::Hide { corner, to, .. }] = acts.as_slice() else {
@@ -149,10 +149,10 @@ fn the_right_hand_display_parks_past_its_right_corner() {
 fn switching_back_unhides_to_the_original_position() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     actions(&mut h);
 
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
 
     let acts = actions(&mut h);
     let [VisibilityAction::Unhide { window, display, to, .. }] = acts.as_slice() else {
@@ -168,9 +168,9 @@ fn switching_back_unhides_to_the_original_position() {
 fn an_unhidden_window_stays_registered_until_it_is_seen_on_a_display() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     flush(&mut h, 11);
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     let txid = flush(&mut h, 11);
 
     // Written, not yet accepted: a crash now must still restore it.
@@ -198,9 +198,9 @@ fn an_animated_unhides_final_frame_event_empties_the_registry() {
     h.reactor.set_presenter(tx);
     assert!(h.reactor.visibility_config().animate_switches);
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     flush(&mut h, 11);
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     let txid = flush(&mut h, 11);
     assert_eq!(h.reactor.parked_registry().len(), 1, "animating: not yet confirmed");
 
@@ -213,9 +213,9 @@ fn an_animated_unhides_final_frame_event_empties_the_registry() {
 fn an_event_before_the_write_went_out_confirms_nothing() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     flush(&mut h, 11);
-    h.cmd(Command::Workspace(1)).unwrap(); // planned, not flushed
+    h.cmd(Command::Workspace("1".into())).unwrap(); // planned, not flushed
     landed(&mut h, 1, frame(), None);
     assert_eq!(h.reactor.parked_registry().len(), 1);
 }
@@ -224,13 +224,13 @@ fn an_event_before_the_write_went_out_confirms_nothing() {
 fn a_stale_on_screen_event_cannot_confirm_a_later_unhide_or_move_a_later_park() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     flush(&mut h, 11);
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     let first_unhide = flush(&mut h, 11);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     let hide = flush(&mut h, 11);
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     let second_unhide = flush(&mut h, 11);
     assert_ne!(first_unhide, second_unhide);
 
@@ -242,7 +242,7 @@ fn a_stale_on_screen_event_cannot_confirm_a_later_unhide_or_move_a_later_park() 
     assert!(h.reactor.parked_registry().is_empty());
 
     // The same for a park: an old on-screen event must not become its parked position.
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     let hide2 = flush(&mut h, 11);
     assert_ne!(hide, hide2);
     landed(&mut h, 1, frame(), second_unhide);
@@ -253,9 +253,9 @@ fn a_stale_on_screen_event_cannot_confirm_a_later_unhide_or_move_a_later_park() 
 fn minimizing_an_unconfirmed_window_clears_its_registry_entry() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     flush(&mut h, 11);
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     flush(&mut h, 11);
     assert_eq!(h.reactor.parked_registry().len(), 1);
 
@@ -269,9 +269,9 @@ fn minimizing_an_unconfirmed_window_clears_its_registry_entry() {
 fn destroying_an_unconfirmed_window_clears_its_registry_entry() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     flush(&mut h, 11);
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     flush(&mut h, 11);
 
     h.cgs_destroyed(11);
@@ -285,9 +285,9 @@ fn an_unconfirmed_entry_expires_after_the_ttl_if_the_window_looks_shown() {
     let clock = Arc::new(ManualClock::new());
     h.reactor.set_clock(clock.clone());
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     flush(&mut h, 11);
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     flush(&mut h, 11);
 
     clock.advance(Duration::from_millis(1500));
@@ -305,9 +305,9 @@ fn an_expired_entry_for_a_window_that_still_looks_parked_is_kept() {
     let clock = Arc::new(ManualClock::new());
     h.reactor.set_clock(clock.clone());
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     flush(&mut h, 11);
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     flush(&mut h, 11);
     // The system reports it still sitting in the corner.
     h.send(Event::WindowFrameChanged(wid(PID, 1), rect(-399., 999., 400., 300.), None, Requested(false), None));
@@ -322,10 +322,10 @@ fn an_expired_entry_for_a_window_that_still_looks_parked_is_kept() {
 fn hiding_again_before_the_unhide_was_seen_registers_the_new_original_position() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     // The unhide never landed; the window is still at the park corner. Hide again.
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     assert!(h.reactor.visibility().is_parked(wid(PID, 1)));
     assert!(!h.reactor.visibility().is_unconfirmed(wid(PID, 1)));
     assert_eq!(h.reactor.parked_registry().len(), 1);
@@ -335,12 +335,12 @@ fn hiding_again_before_the_unhide_was_seen_registers_the_new_original_position()
 fn a_hide_refused_by_shutdown_does_not_lose_the_unconfirmed_entry() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     assert!(h.reactor.visibility().is_unconfirmed(wid(PID, 1)));
     // The check in `plan` is only the fast path; the registry's own refusal is what counts.
     h.reactor.parked_registry().begin_shutdown();
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     assert_eq!(h.reactor.parked_registry().len(), 1, "the mid-unhide entry is still there");
 }
 
@@ -348,7 +348,7 @@ fn a_hide_refused_by_shutdown_does_not_lose_the_unconfirmed_entry() {
 fn the_registry_handle_carries_the_window_server_id() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame()), w(2, 12, rect(300., 500., 200., 100.))]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     assert_eq!(registry_windows(&h), vec![Some(11), Some(12)]);
 }
 
@@ -356,7 +356,7 @@ fn the_registry_handle_carries_the_window_server_id() {
 fn an_app_that_clamps_the_park_move_has_its_real_position_recorded() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     let txid = flush(&mut h, 11);
     let parked_at = |h: &Harness| h.reactor.parked_registry().restore_set()[0].0.parked;
     assert_eq!(parked_at(&h), Point::new(-399., 999.));
@@ -374,7 +374,7 @@ fn an_app_that_clamps_the_park_move_has_its_real_position_recorded() {
 fn a_parked_window_keeps_its_display_when_its_frame_overlaps_a_neighbour() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     assert_eq!(h.display_of(wid(PID, 1)), Some(DisplayUuid::new("LEFT")));
 
     // Our own write reads back a frame lying over RIGHT: the window is still LEFT's.
@@ -388,7 +388,7 @@ fn nothing_is_hidden_or_registered_once_shutdown_has_begun() {
     h.launch(PID, &[w(1, 11, frame())]);
     h.reactor.parked_registry().begin_shutdown();
 
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
 
     assert!(actions(&mut h).is_empty(), "no hide is planned");
     assert!(!h.reactor.visibility().is_parked(wid(PID, 1)));
@@ -400,7 +400,7 @@ fn hides_planned_before_shutdown_are_dropped_at_flush() {
     let mut h = harness();
     h.reactor.set_visibility_config(VisibilityConfig { animate_switches: false });
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     assert_eq!(h.reactor.pending_visibility_actions().len(), 1);
     h.app_requests(PID);
 
@@ -415,11 +415,11 @@ fn a_switch_unhides_the_incoming_windows_before_hiding_the_outgoing_ones() {
     let mut h = harness();
     // Window 1 shows on workspace 1. Window 2 is sent to workspace 3, which nobody shows.
     h.launch(PID, &[w(1, 11, frame()), w(2, 12, rect(300., 500., 200., 100.))]);
-    h.cmd(Command::MoveNodeToWorkspace { workspace: 3, window: Some(wid(PID, 2)), follow: false })
+    h.cmd(Command::MoveNodeToWorkspace { workspace: "3".into(), window: Some(wid(PID, 2)), follow: false })
         .unwrap();
     assert_eq!(unhidden_then_hidden(&actions(&mut h)), vec![(false, 2)]);
 
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
 
     let acts = h.reactor.pending_visibility_actions().to_vec();
     assert_eq!(unhidden_then_hidden(&acts), vec![(true, 2), (false, 1)], "unhide first");
@@ -445,7 +445,7 @@ fn the_registry_always_matches_the_parked_set() {
         keys
     };
     for step in [3, 1, 4, 2, 1, 3] {
-        h.cmd(Command::Workspace(step)).unwrap();
+        h.cmd(Command::Workspace(step.to_string())).unwrap();
         // The invariant check inside `cmd` compares the two; this pins the count too.
         let expected = parked_keys(&h).len() + h.reactor.visibility().unconfirmed_count();
         assert_eq!(h.reactor.parked_registry().len(), expected, "after workspace {step}");
@@ -456,7 +456,7 @@ fn the_registry_always_matches_the_parked_set() {
 fn restore_survives_a_resolution_change_of_the_same_display() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame())]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     actions(&mut h);
 
     // LEFT doubles in size while the window is parked.
@@ -469,7 +469,7 @@ fn restore_survives_a_resolution_change_of_the_same_display() {
     // The termination handler's target follows, so a crash now still restores sensibly.
     assert_eq!(registry_targets(&h), vec![(PID, Point::new(200., 200.))]);
 
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
     let acts = actions(&mut h);
     assert_eq!(acts.len(), 1);
     assert_eq!(acts[0].target(), rect(200., 200., 400., 300.));
@@ -484,7 +484,7 @@ fn restore_falls_back_to_the_current_display_when_the_saved_one_is_gone() {
         wrap: false,
     }))
     .unwrap();
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     assert!(h.reactor.visibility().is_parked(wid(PID, 1)));
     actions(&mut h);
 
@@ -492,7 +492,7 @@ fn restore_falls_back_to_the_current_display_when_the_saved_one_is_gone() {
     assert!(h.reactor.visibility().is_parked(wid(PID, 1)));
     assert_eq!(h.display_of(wid(PID, 1)), Some(DisplayUuid::new("LEFT")));
 
-    h.cmd(Command::Workspace(2)).unwrap();
+    h.cmd(Command::Workspace("2".into())).unwrap();
     let acts = actions(&mut h);
     let [VisibilityAction::Unhide { display, to, .. }] = acts.as_slice() else {
         panic!("expected one unhide, got {acts:?}");
@@ -507,11 +507,11 @@ fn the_restored_window_is_clamped_onto_the_screen() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, rect(700., 100., 400., 300.))]); // mostly on LEFT
     assert_eq!(h.display_of(wid(PID, 1)), Some(DisplayUuid::new("LEFT")));
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     actions(&mut h);
 
     h.screens_named(&[left(800.), right()]); // LEFT shrinks: 0.7 * 800 = 560, +400 > 800
-    h.cmd(Command::Workspace(1)).unwrap();
+    h.cmd(Command::Workspace("1".into())).unwrap();
 
     let acts = actions(&mut h);
     assert_eq!(acts[0].target(), rect(400., 100., 400., 300.));
@@ -521,7 +521,7 @@ fn the_restored_window_is_clamped_onto_the_screen() {
 fn a_window_destroyed_while_parked_leaves_the_registry() {
     let mut h = harness();
     h.launch(PID, &[w(1, 11, frame()), w(2, 12, rect(300., 500., 200., 100.))]);
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     assert_eq!(h.reactor.parked_registry().len(), 2);
 
     h.cgs_destroyed(11);
@@ -541,7 +541,7 @@ fn minimized_windows_and_windows_without_a_display_are_left_alone() {
     h.screens_named(&[left(1000.), right()]);
     h.launch(PID + 1, &[w(1, 21, frame())]);
     h.send(Event::WindowMinimized(wid(PID + 1, 1)));
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     let parked: Vec<_> = actions(&mut h).iter().map(|a| a.window()).collect();
     assert_eq!(parked, vec![wid(PID, 1)], "only the unminimized window is hidden");
 }
@@ -551,12 +551,12 @@ fn instant_mode_writes_positions_unhide_call_first() {
     let mut h = harness();
     h.reactor.set_visibility_config(VisibilityConfig { animate_switches: false });
     h.launch(PID, &[w(1, 11, frame()), w(2, 12, rect(300., 500., 200., 100.))]);
-    h.cmd(Command::MoveNodeToWorkspace { workspace: 3, window: Some(wid(PID, 2)), follow: false })
+    h.cmd(Command::MoveNodeToWorkspace { workspace: "3".into(), window: Some(wid(PID, 2)), follow: false })
         .unwrap();
     h.reactor.flush_visibility();
     h.app_requests(PID);
 
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     h.reactor.flush_visibility();
 
     assert_eq!(
@@ -573,12 +573,12 @@ fn animated_mode_without_a_presenter_still_lands_every_window_unhide_first() {
     let mut h = harness();
     assert!(h.reactor.visibility_config().animate_switches, "animated is the default");
     h.launch(PID, &[w(1, 11, frame()), w(2, 12, rect(300., 500., 200., 100.))]);
-    h.cmd(Command::MoveNodeToWorkspace { workspace: 3, window: Some(wid(PID, 2)), follow: false })
+    h.cmd(Command::MoveNodeToWorkspace { workspace: "3".into(), window: Some(wid(PID, 2)), follow: false })
         .unwrap();
     h.reactor.flush_visibility();
     h.app_requests(PID);
 
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     h.reactor.flush_visibility();
 
     assert_eq!(
@@ -596,13 +596,13 @@ fn animated_mode_hands_the_whole_switch_to_the_presenter_in_one_transition() {
     let (tx, rx) = AnimationSender::channel();
     h.reactor.set_presenter(tx);
     h.launch(PID, &[w(1, 11, frame()), w(2, 12, rect(300., 500., 200., 100.))]);
-    h.cmd(Command::MoveNodeToWorkspace { workspace: 3, window: Some(wid(PID, 2)), follow: false })
+    h.cmd(Command::MoveNodeToWorkspace { workspace: "3".into(), window: Some(wid(PID, 2)), follow: false })
         .unwrap();
     h.reactor.flush_visibility();
     while rx.commands.try_recv().is_ok() {}
     h.app_requests(PID);
 
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     h.reactor.flush_visibility();
 
     let messages: Vec<Message> = std::iter::from_fn(|| rx.commands.try_recv().ok()).collect();
@@ -623,7 +623,7 @@ fn instant_mode_never_starts_a_presenter_transition() {
     h.reactor.set_visibility_config(VisibilityConfig { animate_switches: false });
     h.launch(PID, &[w(1, 11, frame())]);
 
-    h.cmd(Command::Workspace(3)).unwrap();
+    h.cmd(Command::Workspace("3".into())).unwrap();
     h.reactor.flush_visibility();
 
     let messages: Vec<Message> = std::iter::from_fn(|| rx.commands.try_recv().ok()).collect();

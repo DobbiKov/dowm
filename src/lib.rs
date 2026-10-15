@@ -4,6 +4,12 @@
 //!   thin macOS FFI layer in `platform`.
 //! - M1 engine, ported from rift (Apache-2.0, see `NOTICE`): the OS layer in `sys`,
 //!   the per-app actor and presenter in `actor`.
+//! - M3 tiling: the per-workspace tree in `model::tree` / `model::tree_store`, and the
+//!   `LayoutSystem` trait with its three systems (tiles, accordion, floating) and the
+//!   tiling commands in `layout`. Pure logic; the reactor wires it in.
+//! - M4 config: AeroSpace-compatible TOML (`config`), hotkeys and binding modes,
+//!   `on-window-detected` rules, callbacks, gaps. Pure logic; the reactor applies it
+//!   and the platform actors in `actor::input` carry out its effects.
 
 pub mod anim;
 pub mod appspec;
@@ -25,6 +31,10 @@ pub mod platform;
 pub mod actor;
 #[cfg(target_os = "macos")]
 pub mod common;
+#[cfg(target_os = "macos")]
+pub mod config;
+#[cfg(target_os = "macos")]
+pub mod layout;
 #[cfg(target_os = "macos")]
 pub mod model;
 #[cfg(target_os = "macos")]

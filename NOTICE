@@ -1,0 +1,39 @@
+dowm
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software derived from rift
+(https://github.com/acsandmann/rift), licensed under the Apache License,
+Version 2.0:
+
+    Copyright for portions of rift are held by tmandry, 2025 as part of glide-wm
+    (https://github.com/glide-wm/glide).
+    All other copyright for rift are held by acsandmann, 2025.
+
+Files derived from rift:
+
+  Copied with minimal changes (import paths, helpers used only by unported
+  modules removed or made test-only, ScreenId renamed DisplayId):
+    src/sys/{app,axuielement,cocoa,dispatch,display_link,enhanced_ui,event,
+             event_tap,executor,geometry,observer,power,process,run_loop,timer}.rs
+    src/actor/mod.rs
+    src/actor/app.rs
+    src/actor/reactor/transaction_manager.rs
+    src/model/tx_store.rs
+    src/common/collections.rs
+
+  Derived (trimmed to window create/destroy/reorder notifications; space ids
+  in payloads are skipped, never stored or queried):
+    src/sys/window_notify.rs
+
+  Modified (native Space support removed):
+    src/sys/screen.rs        display enumeration only; space queries removed
+    src/sys/skylight.rs      space FFI declarations removed
+    src/sys/window_server.rs space-scoped window queries removed
+    src/actor/reactor/animation.rs
+                             presenter keyed by DisplayId instead of SpaceId;
+                             viewport-camera motion removed; layout entry points
+                             take a PresenterHost instead of rift's Reactor
+
+rift's src/sys/skylight.rs credits private-API declarations to
+https://github.com/asmagill/hs._asm.undocumented.spaces and
+https://github.com/koekeishiya/yabai.
