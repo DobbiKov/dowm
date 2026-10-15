@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::ffi::c_int;
 
 use objc2::rc::Retained;
-use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
+use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUserDefaults};
 
 unsafe extern "C" {
     fn CGSMainConnectionID() -> c_int;
@@ -80,9 +80,45 @@ pub fn system_probe() -> impl FnMut(&[u32]) -> Vec<u32> + Send {
     }
 }
 
+/// Advice for a user whose Mission Control setting makes an unplug split their windows
+/// across native Spaces. `spans_displays` is the `com.apple.spaces` `spans-displays` value:
+/// true means "Displays have separate Spaces" is OFF, which is what dowm wants. An absent
+/// key is macOS's default, separate Spaces ON.
+pub fn separate_spaces_advice(spans_displays: Option<bool>) -> Option<&'static str> {
+    match spans_displays {
+        Some(true) => None,
+        _ => Some(
+            "\"Displays have separate Spaces\" is on: unplugging a display makes macOS move its \
+             Space onto the remaining display and strand windows there. Turn it off in System \
+             Settings > Desktop & Dock > Mission Control, then log out and back in.",
+        ),
+    }
+}
+
+/// The current `spans-displays` setting, if the preference exists.
+pub fn spans_displays() -> Option<bool> {
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let domain = defaults.persistentDomainForName(&NSString::from_str("com.apple.spaces"))?;
+    let value = domain.objectForKey(&NSString::from_str("spans-displays"))?;
+    let number: &NSNumber = value.downcast_ref()?;
+    Some(number.as_bool())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_advice_appears_unless_separate_spaces_are_off() {
+        assert!(separate_spaces_advice(Some(true)).is_none(), "the recommended setting");
+        assert!(separate_spaces_advice(Some(false)).unwrap().contains("Mission Control"));
+        assert!(separate_spaces_advice(None).is_some(), "an absent key is macOS's default: separate Spaces on");
+    }
+
+    #[test]
+    fn reading_the_setting_does_not_panic() {
+        let _ = spans_displays();
+    }
 
     #[test]
     fn only_windows_wholly_outside_the_current_spaces_are_foreign() {

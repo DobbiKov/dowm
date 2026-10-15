@@ -220,6 +220,9 @@ mod daemon {
             std::process::exit(1);
         }
         info!(path = %socket.display(), "listening");
+        if let Some(advice) = dowm::sys::native_spaces::separate_spaces_advice(dowm::sys::native_spaces::spans_displays()) {
+            tracing::warn!("{advice}");
+        }
 
         let (wm_controller, wm_tx) = WmController::new(events_tx.clone());
         let window_notify = WindowNotify::new(events_tx.clone(), notify_rx, WINDOW_EVENTS);

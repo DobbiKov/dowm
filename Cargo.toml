@@ -88,7 +88,7 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "block2", "NSArray", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry",
     "NSKeyValueCoding", "NSNotification", "NSObject", "NSOperation", "NSProcessInfo", "NSRunLoop",
-    "NSString", "NSValue",
+    "NSString", "NSUserDefaults", "NSValue",
 ] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
     "CABase", "CADisplayLink", "CAFrameRateRange", "objc2-core-foundation",

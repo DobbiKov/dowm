@@ -10,6 +10,39 @@ terminal app you launch them from: System Settings > Privacy & Security > Access
 enable Terminal / iTerm / WezTerm, then restart that terminal. Without it `dowm-spike` prints
 a message and exits with status 2.
 
+## Required macOS setting: one Space across displays
+
+dowm does not use native macOS Spaces; it emulates workspaces by parking windows. For that
+to survive unplugging a display, turn **off** "Displays have separate Spaces":
+
+System Settings > Desktop & Dock > Mission Control > *Displays have separate Spaces*, then
+**log out and back in**. (Same as `defaults write com.apple.spaces spans-displays -bool true`
+followed by `killall SystemUIServer` and a logout.)
+
+With it on, unplugging a display makes macOS move that display's Space onto the remaining
+one and leave your other windows behind in a different Space. dowm cannot move windows
+between Spaces (macOS blocks the private calls for ordinary processes), so it only detects
+the split: windows in a Space that is not showing are marked `~` in `dowm list-windows`,
+left alone, and raised only when you ask for them (`workspace N`, `focus`), at which point
+macOS animates the switch to their Space. The daemon logs a warning at startup if the
+setting is on. To merge a stray Space by hand, delete the extra desktop in Mission Control.
+
+## Control socket and CLI
+
+The daemon listens on a Unix socket (`$TMPDIR/dowm-<uid>/dowm.sock`, directory 0700, socket
+0600, peers checked by uid; override with `--socket` or `DOWM_SOCKET`). The same `dowm`
+binary is the client:
+
+    dowm list-workspaces | list-windows | list-monitors [--json]
+    dowm mode
+    dowm subscribe [workspace|focus|mode ...]     # JSON lines until interrupted
+    dowm workspace 3                              # any config command works the same
+    dowm layout tiles horizontal
+
+`exec-and-forget` is only accepted from the config file, never over the socket. Requests
+are length-framed JSON (4-byte big-endian length, 64 KiB limit); the wire types are in
+`crates/dowm-protocol` and the client library in `crates/dowm-client`.
+
 ## Build and test
 
     cargo build --release
